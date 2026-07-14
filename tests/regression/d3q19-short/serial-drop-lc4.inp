@@ -1,0 +1,142 @@
+##############################################################################
+#
+#  Droplet Emulsion 85:15 (input file)
+#
+#  See Lintuvuori et al PRL (2018) Figure 2a-e
+#
+#  -- Note for this regrssion test
+#  For the purposes of this test the system size is reduced to 32^3
+#  isothermal fluctuations are off and we run for 10 steps.
+#  -- End note
+#
+#  See serial-drop-lc3.inp for a full description. We note here only
+#  pertintant differences.
+#
+#  "Parameter Set B"
+#
+#  Compositional order
+#
+#  The composition is 85:15  liquid crystal : isotropic
+#  The reported mean phi should be around 0.7.
+#
+#  Liquid Crystal
+#
+#    lc_a0      0.1
+#    lc_gamma   3.086
+#    lc_q0      0.13884
+#    lc_kappa0  0.07
+#    lc_kappa1  0.07
+#    lc_xi      0.7
+#
+#  This parameter set also has reduced chirality \approx 0.7
+#  and reduced temperature -.25
+#
+#  System size 128 x 128 x 128
+#  q0 = 0.13884 so LC pitch is 64/sqrt(2) and BPI unit cell size is 32
+#  giving 4x4x4 unit cells in the initial condition.
+#
+##############################################################################
+
+N_start  0
+N_cycles 10
+
+##############################################################################
+#
+#  System and MPI
+#
+##############################################################################
+
+size 32_32_32
+
+##############################################################################
+#
+#  Fluid parameters
+#
+##############################################################################
+
+viscosity 0.5
+
+isothermal_fluctuations off
+temperature 0.0000096
+
+##############################################################################
+#
+#  Free energy parameters
+#
+###############################################################################
+
+free_energy lc_droplet
+fe_force_method           relaxation_antisymmetric
+
+fd_advection_scheme_order 3
+fd_gradient_calculation 3d_7pt_fluid
+
+###############################################################################
+#
+#  Free energy
+#
+###############################################################################
+
+A -0.000625
+B 0.000625
+K 0.00053
+
+mobility 5.0
+
+phi_initialisation patches
+phi_init_patch_size 4
+phi_init_patch_vol 0.15
+
+lc_a0      0.1
+lc_gamma   3.086
+lc_q0      0.13884
+lc_kappa0  0.07
+lc_kappa1  0.07
+lc_xi      0.7
+
+lc_Gamma   0.5
+lc_noise     0
+lc_activity  0
+
+lc_q_initialisation o8m
+lc_q_init_amplitude -0.2
+lc_init_redshift 1.0
+
+lc_droplet_gamma 2.586
+lc_droplet_delta 0.25 
+lc_droplet_W 0.0
+
+###############################################################################
+#
+#  Colloid parameters
+#
+###############################################################################
+
+colloid_init        no_colloids
+
+###############################################################################
+#
+#  Periodic conditions / boundaries
+#
+###############################################################################
+
+periodicity 1_1_1
+
+###############################################################################
+#
+#  Output frequency and type
+#
+###############################################################################
+
+freq_statistics 10
+config_at_end   no
+
+###############################################################################
+#
+#  Miscellaneous
+#
+#  random_seed  +ve integer is the random number generator seed
+#
+###############################################################################
+
+random_seed 8361235

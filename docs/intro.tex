@@ -1,0 +1,121 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  intro.tex
+%
+%  Contains introduction and quick start for users.
+%
+%  Edinburgh Soft Matter and Statistical Physics Group and
+%  Edinburgh Parallel Computing Centre
+%
+%  (c) 2016-2023 The University of Edinburgh
+%
+%  This material is being migrated to https://ludwig.epcc.ed.ac.uk/index.html
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Introduction}
+
+\subsection{Overview}
+
+This introduction provides a brief overview of what the \textit{Ludwig} code
+does, how to obtain and build it, and how to run a sample problem.
+It is assumed that the reader has at least a general knowledge
+of Navier-Stokes hydrodynamics, complex fluids, and to some
+extent statistical physics. This knowledge will be required to make sense
+of the input and output involved in using the code. Those wanting
+to work on or develop the code itself will need knowledge of ANSI C,
+and perhaps message passing and CUDA. We assume the reader is using
+a Unix-based system.
+
+\subsubsection{Purpose of the code}
+
+The \textit{Ludwig} code has been developed over a number of
+years to address specific problems in complex fluids. The underlying
+hydrodynamic model is based on the lattice Boltzmann equation
+(LBE, or just `LB'). This itself may be used to study simple
+(Newtonian) fluids in a number of different scenarios, including porous
+media and particle suspensions. However, the
+code is more generally suited to complex fluids, where a number of
+options are available, among others: symmetric binary fluids and
+Brazovskii smectics,
+polar gels, liquid crystals, or charged fluid via a Poisson-Boltzmann
+equation approach. These features are added in the framework of a
+free energy approach, where specific compositional or orientational
+order parameters are evolved according to the appropriate
+coarse-grained dynamics, but also interact with the fluid in a
+fully coupled fashion.
+
+A number of other features are catered for is some or all situations.
+These include fluctuating hydrodynamics, and appropriate fluctuating
+versions of order parameter dynamics for binary solvents and liquid
+crystals. Colloidal particles are available for simulation of
+suspensions and dispersions, and with appropriate boundary
+conditions binary mixtures, liquid crystals, and charged fluid. Shear
+flow is available for fluid-only systems implemented via Lees-Edwards
+sliding periodic boundaries. Not all these features play with all the
+others: check the specific section of the document for details.
+
+Broadly, the code is intended for complex fluid problems at low
+Reynolds numbers, so there is no consideration of turbulence,
+high Mach number flows, high density ratio flows, and so on.
+
+\subsubsection{How the code works}
+
+We aim to provide a robust and portable code, written in ANSI C, which
+can be used to perform serial and scalable parallel simulations of
+complex fluid systems based around hydrodynamics via the lattice
+Boltzmann method. Time evolution of modelled quantities takes
+place on a fixed regular discrete lattice. The preferred method of
+dealing with the corresponding order parameter equations is by
+using finite difference. However, for the case of a binary fluid,
+a two-distribution lattice Boltzmann approach is also maintained
+for historical reference.
+
+Users control the operation of the code via a plain text input file;
+output for various data are available. These data may be visualised
+using appropriate third-party software (e.g., Paraview). Specific
+diagnostic output may require alterations to the code.
+
+Potential users should also note that the complex fluid simulations
+enabled by \textit{Ludwig} can be time consuming, prone to instability,
+and provide results which are difficult to
+interpret. We make no apology for this: that's the way it is.
+
+\subsubsection{Who should read what?}
+
+This documentation is aimed largely at users, but includes information
+that will also be relevant for developers. The documentation discusses
+the underlying features of the coordinate system, hydrodynamics (LB), and
+other generic features, and has a separate section for each free energy.
+You will need to consult the section relevant to your problem.
+
+
+\subsection{Obtaining the code}
+
+The code is publicly available from
+\texttt{http://github/ludwig-cf/ludwig/}
+which provides revision control via git, issue tracking, and so on.
+
+The current stable release is available as the master branch.
+
+\subsection{Note on Units}
+
+All computation in \textit{Ludwig} is undertaken in ``lattice
+units,'' fundamentally related to the underlying LB fluid model
+which expects discrete model space and time steps
+$\Delta x = \Delta t = 1$. The natural way to approach problems
+is then to ensure that appropriate dimensionless quantities are
+reasonable. However, ``reasonable'' may not equate to ``matching
+experimental values''. For example, typical flows in colloidal
+suspensions my exhibit Reynolds numbers as low as $O(10^{-6})$
+to $O(10^{-8})$.
+Matching such a value in a computation may imply an impractically
+small time step; a solution is to let the Reynolds number rise
+artificially with the constraint that it remains small compared to $O(1)$.
+Further discussion of the issue of units is provided in, e.g.,
+\cite{cates_scaling}. Again, consult the relevant section of the documentation
+for comments on specific problems.
+
+
+\vfill
+\pagebreak
