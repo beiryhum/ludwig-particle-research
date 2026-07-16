@@ -29,6 +29,8 @@
 
 enum map_initial_status {MAP_INIT_FLUID_ONLY,
 			 MAP_INIT_CIRCLE_XY,
+			 MAP_INIT_CIRCLE_YZ,
+			 MAP_INIT_CIRCLE_XZ,
 			 MAP_INIT_SQUARE_XY,
 			 MAP_INIT_WALL_X,
 			 MAP_INIT_WALL_Y,
@@ -180,35 +182,54 @@ __host__ int map_init_options(pe_t * pe, cs_t * cs,
   map_t * map = NULL;
   map_create(pe, cs, &opts, &map);
 
-  switch (options->geometry) {
+    switch (options->geometry) {
+
   case MAP_INIT_FLUID_ONLY:
-    /* Do nothing; it's default in map_create() */
+    /* Do nothing; it is the default in map_create(). */
     break;
+
   case MAP_INIT_CIRCLE_XY:
     map_init_status_circle_xy(map);
     break;
-  case MAP_INIT_SQUARE_XY: /* to include "rectangles" */
+
+  case MAP_INIT_CIRCLE_YZ:
+    map_init_status_circle_yz(map);
+    break;
+
+  case MAP_INIT_CIRCLE_XZ:
+    map_init_status_circle_xz(map);
+    break;
+
+  case MAP_INIT_SQUARE_XY:
+    /* Includes rectangular geometries. */
     map_init_status_wall(map, X);
     map_init_status_wall(map, Y);
     break;
+
   case MAP_INIT_WALL_X:
     map_init_status_wall(map, X);
     break;
+
   case MAP_INIT_WALL_Y:
     map_init_status_wall(map, Y);
     break;
+
   case MAP_INIT_WALL_Z:
     map_init_status_wall(map, Z);
     break;
+
   case MAP_INIT_SIMPLE_CUBIC:
     map_init_status_simple_cubic(map, options->acell);
     break;
+
   case MAP_INIT_FACE_CENTRED_CUBIC:
     map_init_status_face_centred_cubic(map, options->acell);
     break;
+
   case MAP_INIT_BODY_CENTRED_CUBIC:
     map_init_status_body_centred_cubic(map, options->acell);
     break;
+
   default:
     pe_fatal(pe, "Internal error: unrecognised porous media geometry\n");
   }
@@ -241,44 +262,52 @@ __host__ int map_init_options_parse(pe_t * pe, cs_t * cs, rt_t * rt,
     if (is_init) {
 
       if (strncmp(ptype, "circle_xy", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_CIRCLE_XY;
+        options->ndata = 0;
+        options->geometry = MAP_INIT_CIRCLE_XY;
+      }
+      else if (strncmp(ptype, "circle_yz", BUFSIZ) == 0) {
+        options->ndata = 0;
+        options->geometry = MAP_INIT_CIRCLE_YZ;
+      }
+      else if (strncmp(ptype, "circle_xz", BUFSIZ) == 0) {
+        options->ndata = 0;
+        options->geometry = MAP_INIT_CIRCLE_XZ;
       }
       else if (strncmp(ptype, "square_xy", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_SQUARE_XY;
+        options->ndata = 0;
+        options->geometry = MAP_INIT_SQUARE_XY;
       }
       else if (strncmp(ptype, "wall_x", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_WALL_X;
+        options->ndata = 0;
+        options->geometry = MAP_INIT_WALL_X;
       }
       else if (strncmp(ptype, "wall_y", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_WALL_Y;
+        options->ndata = 0;
+        options->geometry = MAP_INIT_WALL_Y;
       }
       else if (strncmp(ptype, "wall_z", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_WALL_Z;
+        options->ndata = 0;
+        options->geometry = MAP_INIT_WALL_Z;
       }
       else if (strncmp(ptype, "simple_cubic", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_SIMPLE_CUBIC;
-	options->acell = map_init_option_acell(pe, cs, rt);
+        options->ndata = 0;
+        options->geometry = MAP_INIT_SIMPLE_CUBIC;
+        options->acell = map_init_option_acell(pe, cs, rt);
       }
       else if (strncmp(ptype, "face_centred_cubic", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_FACE_CENTRED_CUBIC;
-	options->acell = map_init_option_acell(pe, cs, rt);
+        options->ndata = 0;
+        options->geometry = MAP_INIT_FACE_CENTRED_CUBIC;
+        options->acell = map_init_option_acell(pe, cs, rt);
       }
       else if (strncmp(ptype, "body_centred_cubic", BUFSIZ) == 0) {
-	options->ndata = 0;
-	options->geometry = MAP_INIT_BODY_CENTRED_CUBIC;
-	options->acell = map_init_option_acell(pe, cs, rt);
+        options->ndata = 0;
+        options->geometry = MAP_INIT_BODY_CENTRED_CUBIC;
+        options->acell = map_init_option_acell(pe, cs, rt);
       }
       else {
-	/* Not recognised */
-	pe_info(pe, "Input: porous_media_init not recognised %s\n\n", ptype);
-	pe_fatal(pe, "Please check and try again.\n");
+        pe_info(pe, "Input: porous_media_init not recognised %s\n\n",
+                ptype);
+        pe_fatal(pe, "Please check and try again.\n");
       }
     }
   }

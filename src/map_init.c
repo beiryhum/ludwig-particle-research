@@ -1,6 +1,6 @@
 /*****************************************************************************
  *
- *  map_init.h
+ *  map_init.c
  *
  *  Various map status/data initialisations.
  *
@@ -77,6 +77,178 @@ int map_init_status_circle_xy(map_t * map) {
       }
     }
   }
+
+  map_pm_set(map, 1);
+
+  return 0;
+}
+/*****************************************************************************
+ *
+ *  map_init_status_circle_yz
+ *
+ *  Circular fluid region in the (y,z) plane, extending uniformly
+ *  in the x direction.
+ *
+ *  The centre is at (Ly/2, Lz/2), with a solid outer boundary
+ *  at the edges of the (y,z) computational cross-section.
+ *
+ *****************************************************************************/
+
+int map_init_status_circle_yz(map_t * map) {
+
+  int ntotal[3] = {0};
+  int nlocal[3] = {0};
+  int noffset[3] = {0};
+  double y0, z0, r0;
+
+  cs_t * cs = NULL;
+
+  assert(map);
+
+  cs = map->cs;
+  cs_ntotal(cs, ntotal);
+  cs_nlocal(cs, nlocal);
+  cs_nlocal_offset(cs, noffset);
+
+  /* Check that the (y,z) cross-section is square. */
+
+  if (ntotal[Y] != ntotal[Z]) {
+    pe_t * pe = map->pe;
+    pe_fatal(pe, "map_init_status_circle_yz must have Ly == Lz\n");
+  }
+
+  /*
+   * Global centre and radius.
+   *
+   * For example, Ly = Lz = 66 gives:
+   *
+   *   y0 = z0 = 33.5
+   *   r0 = 32.0
+   *
+   * The sites outside the circle are solid boundary sites.
+   */
+
+  y0 = 0.5*(1 + ntotal[Y]);
+  z0 = 0.5*(1 + ntotal[Z]);
+  r0 = 0.5*(ntotal[Y] - 2);
+
+  /* Assign fluid/solid status. */
+
+  for (int ic = 1; ic <= nlocal[X]; ic++) {
+    for (int jc = 1; jc <= nlocal[Y]; jc++) {
+
+      double y = (noffset[Y] + jc) - y0;
+
+      for (int kc = 1; kc <= nlocal[Z]; kc++) {
+
+        double z = (noffset[Z] + kc) - z0;
+        double r2 = y*y + z*z;
+        char status = MAP_BOUNDARY;
+        int index = cs_index(cs, ic, jc, kc);
+
+        if (r2 <= r0*r0) {
+          status = MAP_FLUID;
+        }
+
+        map_status_set(map, index, status);
+      }
+    }
+  }
+
+  /* Mark the map as porous media so that wall bounce-back is activated. */
+
+  map_pm_set(map, 1);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  map_init_status_circle_xz
+ *
+ *  Circular fluid region in the (x,z) plane, extending uniformly
+ *  in the y direction.
+ *
+ *  This geometry represents a circular pipe whose axis is parallel
+ *  to the y direction.
+ *
+ *****************************************************************************/
+
+int map_init_status_circle_xz(map_t * map) {
+
+  int ntotal[3] = {0};
+  int nlocal[3] = {0};
+  int noffset[3] = {0};
+
+  double x0 = 0.0;
+  double z0 = 0.0;
+  double r0 = 0.0;
+
+  cs_t * cs = NULL;
+
+  assert(map);
+
+  cs = map->cs;
+
+  cs_ntotal(cs, ntotal);
+  cs_nlocal(cs, nlocal);
+  cs_nlocal_offset(cs, noffset);
+
+  /*
+   * The cross-section is in the (x,z) plane, so the global
+   * dimensions in x and z must be equal.
+   */
+
+  if (ntotal[X] != ntotal[Z]) {
+    pe_t * pe = map->pe;
+    pe_fatal(pe, "map_init_status_circle_xz must have Lx == Lz\n");
+  }
+
+  /*
+   * Centre and geometrical radius.
+   *
+   * For Lx = Lz = 66:
+   *
+   *   x0 = z0 = 33.5
+   *   r0 = 32.0
+   */
+
+  x0 = 0.5*(1 + ntotal[X]);
+  z0 = 0.5*(1 + ntotal[Z]);
+  r0 = 0.5*(ntotal[X] - 2);
+
+  /*
+   * Assign the same circular cross-section at every y position.
+   */
+
+  for (int ic = 1; ic <= nlocal[X]; ic++) {
+
+    double x = (noffset[X] + ic) - x0;
+
+    for (int kc = 1; kc <= nlocal[Z]; kc++) {
+
+      double z = (noffset[Z] + kc) - z0;
+      double r2 = x*x + z*z;
+
+      char status = MAP_BOUNDARY;
+
+      if (r2 <= r0*r0) {
+        status = MAP_FLUID;
+      }
+
+      for (int jc = 1; jc <= nlocal[Y]; jc++) {
+
+        int index = cs_index(cs, ic, jc, kc);
+
+        map_status_set(map, index, status);
+      }
+    }
+  }
+
+  /*
+   * Inform the wall subsystem that this map contains porous-media
+   * solid boundaries.
+   */
 
   map_pm_set(map, 1);
 
