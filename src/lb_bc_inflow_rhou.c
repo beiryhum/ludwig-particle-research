@@ -142,6 +142,7 @@ __host__ int lb_bc_inflow_init_link(lb_bc_inflow_rhou_t * inflow,
 
   cs_t * cs = NULL;
   int noffset[3] = {0};
+  int periodic[3] = {0};
   int nlink = 0;
 
   assert(inflow);
@@ -149,6 +150,7 @@ __host__ int lb_bc_inflow_init_link(lb_bc_inflow_rhou_t * inflow,
 
   cs = inflow->cs;
   cs_nlocal_offset(cs, noffset);
+  cs_periodic(cs, periodic);
 
   if (noffset[id] == 0) {
     int ntotal[3] = {0};
@@ -180,10 +182,22 @@ __host__ int lb_bc_inflow_init_link(lb_bc_inflow_rhou_t * inflow,
 
 	    int ijk[3] = {ic1, jc1, kc1};
 
-	    if (noffset[id1] + ijk[id1] < 1          ) continue;
-	    if (noffset[id1] + ijk[id1] > ntotal[id1]) continue;
-	    if (noffset[id2] + ijk[id2] < 1          ) continue;
-	    if (noffset[id2] + ijk[id2] > ntotal[id2]) continue;
+	    	    /*
+	     * A transverse link outside the global domain is excluded only
+	     * for a non-periodic direction. In a periodic direction, the
+	     * corresponding linki site is a valid halo site supplied by the
+	     * transverse halo exchange.
+	     */
+
+	    if (!periodic[id1]) {
+	      if (noffset[id1] + ijk[id1] < 1)           continue;
+	      if (noffset[id1] + ijk[id1] > ntotal[id1]) continue;
+	    }
+
+	    if (!periodic[id2]) {
+	      if (noffset[id2] + ijk[id2] < 1)           continue;
+	      if (noffset[id2] + ijk[id2] > ntotal[id2]) continue;
+	    }
 
 	    if (init == LINK_ASSIGN) {
 	      inflow->linkp[nlink] = model.nvel - p; /* reverse */
@@ -291,8 +305,11 @@ __host__ int lb_bc_inflow_rhou_update(lb_bc_inflow_rhou_t * inflow,
  *****************************************************************************/
 
 __host__ int lb_bc_inflow_rhou_halo_update(lb_bc_inflow_rhou_t * inflow,
-					   hydro_t * hydro) {
+                                           hydro_t * hydro) {
   cs_t * cs = NULL;
+  int id = -1;
+  int id1 = -1;
+  int id2 = -1;
   int noffset[3] = {0};
   int nlocal[3]  = {0};
 
@@ -305,101 +322,113 @@ __host__ int lb_bc_inflow_rhou_halo_update(lb_bc_inflow_rhou_t * inflow,
   cs_nlocal(cs, nlocal);
   cs_nlocal_offset(cs, noffset);
 
-  /* Must have flow in x-direction at the moment! */
-  assert(inflow->options.flow[X]);
+  if (inflow->options.flow[X]) id = X;
+  if (inflow->options.flow[Y]) id = Y;
+  if (inflow->options.flow[Z]) id = Z;
 
-  if (noffset[X] == 0) {
+  assert(id == X || id == Y || id == Z);
 
+  id1 = (id + 1) % 3;
+  id2 = (id + 2) % 3;
+
+  if (noffset[id] == 0) {
     MPI_Comm comm = MPI_COMM_NULL;
     MPI_Request req[8] = {0};
-    double *buf[8] = {0};
+    double * buf[8] = {0};
     int ngbr[8] = {0};
-    int count[8] = {0};     /* Data items */
-    int nhalo = 1;          /* Only ever one if distributions are involved. */
+    int count[8] = {0};
+    const int nhalo = 1;
+    const int count1 = 4*nlocal[id2]*nhalo;
+    const int count2 = 4*nlocal[id1]*nhalo;
 
-    /* Recv from ... */
     cs_cart_comm(cs, &comm);
-    ngbr[0] = cs_cart_neighb(cs, FORWARD,  Y);
-    ngbr[1] = cs_cart_neighb(cs, BACKWARD, Y);
-    ngbr[2] = cs_cart_neighb(cs, FORWARD,  Z);
-    ngbr[3] = cs_cart_neighb(cs, BACKWARD, Z);
 
-    /* Send to ... */
-    ngbr[4] = cs_cart_neighb(cs, BACKWARD, Y);
-    ngbr[5] = cs_cart_neighb(cs, FORWARD,  Y);
-    ngbr[6] = cs_cart_neighb(cs, BACKWARD, Z);
-    ngbr[7] = cs_cart_neighb(cs, FORWARD,  Z);
+    /* Receive from the two transverse coordinate directions. */
+    ngbr[0] = cs_cart_neighb(cs, FORWARD,  id1);
+    ngbr[1] = cs_cart_neighb(cs, BACKWARD, id1);
+    ngbr[2] = cs_cart_neighb(cs, FORWARD,  id2);
+    ngbr[3] = cs_cart_neighb(cs, BACKWARD, id2);
 
-    {
-      int countY = 4*nlocal[Z]*nhalo*nhalo;   /* 4 (rho, u_x, u_y, u_z) */
-      int countZ = 4*nlocal[Y]*nhalo*nhalo;
-      count[0] = countY;
-      count[1] = countY;
-      count[2] = countZ;
-      count[3] = countZ;
-      count[4] = countY;
-      count[5] = countY;
-      count[6] = countZ;
-      count[7] = countZ;
-    }
+    /* Send to the opposite neighbours. */
+    ngbr[4] = cs_cart_neighb(cs, BACKWARD, id1);
+    ngbr[5] = cs_cart_neighb(cs, FORWARD,  id1);
+    ngbr[6] = cs_cart_neighb(cs, BACKWARD, id2);
+    ngbr[7] = cs_cart_neighb(cs, FORWARD,  id2);
+
+    count[0] = count1;
+    count[1] = count1;
+    count[2] = count2;
+    count[3] = count2;
+    count[4] = count1;
+    count[5] = count1;
+    count[6] = count2;
+    count[7] = count2;
 
     for (int m = 0; m < 8; m++) {
       pe_t * pe = inflow->pe;
+
       req[m] = MPI_REQUEST_NULL;
       buf[m] = (double *) malloc(sizeof(double)*count[m]);
       assert(buf[m]);
       if (buf[m] == NULL) pe_fatal(pe, "malloc() failed\n");
     }
 
-    /* Post receives */
     for (int m = 0; m < 4; m++) {
       MPI_Irecv(buf[m], count[m], MPI_DOUBLE, ngbr[m], tag, comm, req + m);
     }
 
-    /* Pack buffers and post sends */
+    /* Pack the open-boundary halo plane and post the four sends. */
     for (int ms = 0; ms < 4; ms++) {
       int m = 4 + ms;
       int ib = 0;
-      int nhm1 = nhalo-1;
-      cs_limits_t lim = {0};
+      int lo1 = 1;
+      int hi1 = nlocal[id1];
+      int lo2 = 1;
+      int hi2 = nlocal[id2];
 
-      if (m == 4) { /* send to Y-1,Z */
-	lim.jmin = 1;                lim.jmax = nhalo;
-	lim.kmin = 1;                lim.kmax = nlocal[Z];
+      if (m == 4) {
+        lo1 = 1;
+        hi1 = nhalo;
       }
-      if (m == 5) { /* send to Y+1,Z */
-	lim.jmin = nlocal[Y] - nhm1; lim.jmax = nlocal[Y];
-	lim.kmin = 1;                lim.kmax = nlocal[Z];
+      if (m == 5) {
+        lo1 = nlocal[id1] - nhalo + 1;
+        hi1 = nlocal[id1];
       }
-      if (m == 6) { /* send to Y,Z-1 */
-	lim.jmin = 1;                lim.jmax = nlocal[Y];
-	lim.kmin = 1;                lim.kmax = nhalo;
+      if (m == 6) {
+        lo2 = 1;
+        hi2 = nhalo;
       }
-      if (m == 7) { /* send to Y,Z+1 */
-	lim.jmin = 1;                lim.jmax = nlocal[Y];
-	lim.kmin = nlocal[Z] - nhm1; lim.kmax = nlocal[Z];
+      if (m == 7) {
+        lo2 = nlocal[id2] - nhalo + 1;
+        hi2 = nlocal[id2];
       }
 
-      int ic = 0;
-      for (int jc = lim.jmin; jc <= lim.jmax; jc++) {
-	for (int kc = lim.kmin; kc <= lim.kmax; kc++) {
-	  int index = cs_index(cs, ic, jc, kc);
-	  double rho = 0.0;
-	  double u[3] = {0};
-	  hydro_rho(hydro, index, &rho);
-	  hydro_u(hydro, index, u);
-	  buf[m][ib++] = rho;
-	  buf[m][ib++] = u[X];
-	  buf[m][ib++] = u[Y];
-	  buf[m][ib++] = u[Z];
-	}
+      for (int i1 = lo1; i1 <= hi1; i1++) {
+        for (int i2 = lo2; i2 <= hi2; i2++) {
+          int ijk[3] = {0};
+          int index = -1;
+          double rho = 0.0;
+          double u[3] = {0};
+
+          ijk[id]  = 0;
+          ijk[id1] = i1;
+          ijk[id2] = i2;
+          index = cs_index(cs, ijk[X], ijk[Y], ijk[Z]);
+
+          hydro_rho(hydro, index, &rho);
+          hydro_u(hydro, index, u);
+
+          buf[m][ib++] = rho;
+          buf[m][ib++] = u[X];
+          buf[m][ib++] = u[Y];
+          buf[m][ib++] = u[Z];
+        }
       }
+
       assert(ib == count[m]);
-
       MPI_Isend(buf[m], count[m], MPI_DOUBLE, ngbr[m], tag, comm, req + m);
     }
 
-    /* Process */
     for (int ms = 0; ms < 8; ms++) {
       int m = -1;
       MPI_Status status = {0};
@@ -409,59 +438,64 @@ __host__ int lb_bc_inflow_rhou_halo_update(lb_bc_inflow_rhou_t * inflow,
       if (status.MPI_SOURCE == MPI_PROC_NULL) continue;
 
       if (m >= 4) {
-	/* Send has completed */
-	free(buf[m]);
-	buf[m] = NULL;
+        free(buf[m]);
+        buf[m] = NULL;
       }
       else {
-	/* Recv has arrived: unpack to correct destination */
-	int ib = 0;
-	cs_limits_t lim = {0};
+        int ib = 0;
+        int lo1 = 1;
+        int hi1 = nlocal[id1];
+        int lo2 = 1;
+        int hi2 = nlocal[id2];
 
-	if (m == 0) { /* recv from Y+1,Z */
-	  lim.jmin = nlocal[Y] + 1;    lim.jmax = nlocal[Y] + nhalo;
-	  lim.kmin = 1;                lim.kmax = nlocal[Z];
-	}
-	if (m == 1) { /* recv from Y-1,Z */
-	  lim.jmin = 1 - nhalo;        lim.jmin = 0;
-	  lim.kmin = 1;                lim.kmax = nlocal[Z];
-	}
-	if (m == 2) { /* recv from Y, Z+1 */
-	  lim.jmin = 1;                lim.jmax = nlocal[Y];
-	  lim.kmin = nlocal[Z] + 1;    lim.kmax = nlocal[Z] + nhalo;
-	}
-	if (m == 3) { /* recv from Y, Z-1 */
-	  lim.jmin = 1;                lim.jmax = nlocal[Y];
-	  lim.kmin = 1 - nhalo;        lim.kmax = 0;
-	}
+        if (m == 0) {
+          lo1 = nlocal[id1] + 1;
+          hi1 = nlocal[id1] + nhalo;
+        }
+        if (m == 1) {
+          lo1 = 1 - nhalo;
+          hi1 = 0;
+        }
+        if (m == 2) {
+          lo2 = nlocal[id2] + 1;
+          hi2 = nlocal[id2] + nhalo;
+        }
+        if (m == 3) {
+          lo2 = 1 - nhalo;
+          hi2 = 0;
+        }
 
-	int ic = 0;
-	for (int jc = lim.jmin; jc <= lim.jmax; jc++) {
-	  for (int kc = lim.kmin; kc <= lim.kmax; kc++) {
-	    int index = cs_index(cs, ic, jc, kc);
-	    double rho = 0.0;
-	    double u[3] = {0};
-	    rho  = buf[m][ib++];
-	    u[X] = buf[m][ib++];
-	    u[Y] = buf[m][ib++];
-	    u[Z] = buf[m][ib++];
-	    hydro_rho_set(hydro, index, rho);
-	    hydro_u_set(hydro, index, u);
-	  }
-	}
-	assert(ib == count[m]);
+        for (int i1 = lo1; i1 <= hi1; i1++) {
+          for (int i2 = lo2; i2 <= hi2; i2++) {
+            int ijk[3] = {0};
+            int index = -1;
+            double rho = 0.0;
+            double u[3] = {0};
 
-	/* Done with this message */
-	free(buf[m]);
-	buf[m] = NULL;
+            ijk[id]  = 0;
+            ijk[id1] = i1;
+            ijk[id2] = i2;
+            index = cs_index(cs, ijk[X], ijk[Y], ijk[Z]);
+
+            rho  = buf[m][ib++];
+            u[X] = buf[m][ib++];
+            u[Y] = buf[m][ib++];
+            u[Z] = buf[m][ib++];
+
+            hydro_rho_set(hydro, index, rho);
+            hydro_u_set(hydro, index, u);
+          }
+        }
+
+        assert(ib == count[m]);
+        free(buf[m]);
+        buf[m] = NULL;
       }
     }
 
-    /* Ensure we have released all the buffers */
     for (int m = 0; m < 8; m++) {
       free(buf[m]);
     }
-    /* Finish */
   }
 
   return 0;
@@ -482,45 +516,48 @@ __host__ int lb_bc_inflow_rhou_impose(lb_bc_inflow_rhou_t * inflow,
   assert(hydro);
   assert(lb);
 
-  /* Ensure we have appropriate halo values (rho, u) at inflow */
-  /* We can skip in serial, as we must have a completely non-periodic system */
-
+  /*
+   * The boundary update sets rho and u on the normal inflow halo plane.
+   * Exchange the transverse parts of that plane before reconstructing
+   * incoming distributions at linki.
+   */
   if (pe_mpi_size(inflow->pe) > 1) {
     lb_bc_inflow_rhou_halo_update(inflow, hydro);
   }
-
-  /* For each incoming link set f_p = f^eq_p (rho, u) */
 
   for (int n = 0; n < inflow->nlink; n++) {
 
     int index = inflow->linki[n];
     int8_t p  = inflow->linkp[n];
 
-    double rho  = 0.0;
-    double u[3] = {0};
+    double rho = 0.0;
+    double u[3] = {0.0, 0.0, 0.0};
 
     hydro_rho(hydro, index, &rho);
     hydro_u(hydro, index, u);
 
     {
       double cs2   = lb->model.cs2;
-      double rcs2  = (1.0/cs2);
+      double rcs2  = 1.0/cs2;
       double udotc = 0.0;
       double sdotq = 0.0;
       double fp    = 0.0;
 
       for (int ia = 0; ia < 3; ia++) {
 	udotc += u[ia]*lb->model.cv[p][ia];
+
 	for (int ib = 0; ib < 3; ib++) {
 	  double d_ab = (ia == ib);
-	  double s_ab = lb->model.cv[p][ia]*lb->model.cv[p][ib] - cs2*d_ab;
+	  double s_ab =
+	    lb->model.cv[p][ia]*lb->model.cv[p][ib] - cs2*d_ab;
 
 	  sdotq += s_ab*u[ia]*u[ib];
 	}
       }
 
-      /* Here's the equilibrium */
-      fp = rho*lb->model.wv[p]*(1.0 + rcs2*udotc + 0.5*rcs2*rcs2*sdotq);
+      fp = rho*lb->model.wv[p]*
+	(1.0 + rcs2*udotc + 0.5*rcs2*rcs2*sdotq);
+
       lb_f_set(lb, index, p, LB_RHO, fp);
     }
   }

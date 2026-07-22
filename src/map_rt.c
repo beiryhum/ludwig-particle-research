@@ -31,6 +31,11 @@ enum map_initial_status {MAP_INIT_FLUID_ONLY,
 			 MAP_INIT_CIRCLE_XY,
 			 MAP_INIT_CIRCLE_YZ,
 			 MAP_INIT_CIRCLE_XZ,
+
+       MAP_INIT_SOLID_CYLINDER_XY,
+       MAP_INIT_SOLID_CYLINDER_YZ,
+       MAP_INIT_SOLID_CYLINDER_XZ,
+
 			 MAP_INIT_SQUARE_XY,
 			 MAP_INIT_WALL_X,
 			 MAP_INIT_WALL_Y,
@@ -46,6 +51,9 @@ struct map_keys_s {
   int ndata;
   int geometry;
   int acell;      /* cubic lattice constant; an integer */
+
+  double cylinder_centre[3];
+  double cylinder_radius;
 };
 
 __host__ int map_init_options(pe_t * pe, cs_t * cs, 
@@ -200,6 +208,36 @@ __host__ int map_init_options(pe_t * pe, cs_t * cs,
     map_init_status_circle_xz(map);
     break;
 
+  case MAP_INIT_SOLID_CYLINDER_XY:
+  /*
+   * Circular section in xy; cylinder axis z.
+   */
+    map_init_status_solid_cylinder(
+      map, Z,
+      options->cylinder_centre,
+      options->cylinder_radius);
+    break;
+
+case MAP_INIT_SOLID_CYLINDER_YZ:
+  /*
+   * Circular section in yz; cylinder axis x.
+   */
+    map_init_status_solid_cylinder(
+      map, X,
+      options->cylinder_centre,
+      options->cylinder_radius);
+    break;
+
+case MAP_INIT_SOLID_CYLINDER_XZ:
+  /*
+   * Circular section in xz; cylinder axis y.
+   */
+    map_init_status_solid_cylinder(
+      map, Y,
+      options->cylinder_centre,
+      options->cylinder_radius);
+    break;
+  
   case MAP_INIT_SQUARE_XY:
     /* Includes rectangular geometries. */
     map_init_status_wall(map, X);
@@ -272,6 +310,81 @@ __host__ int map_init_options_parse(pe_t * pe, cs_t * cs, rt_t * rt,
       else if (strncmp(ptype, "circle_xz", BUFSIZ) == 0) {
         options->ndata = 0;
         options->geometry = MAP_INIT_CIRCLE_XZ;
+      }
+      else if (strncmp(ptype, "solid_cylinder_xy", BUFSIZ) == 0) {
+
+        options->ndata = 0;
+        options->geometry = MAP_INIT_SOLID_CYLINDER_XY;
+
+        int have_centre = rt_double_parameter_vector(
+            rt,
+            "porous_media_cylinder_center",
+            options->cylinder_centre);
+
+        int have_radius = rt_double_parameter(
+            rt,
+            "porous_media_cylinder_radius",
+            &options->cylinder_radius);
+
+        if (have_centre == 0) {
+            pe_fatal(pe,
+            "Key porous_media_cylinder_center expected but not present\n");
+        }
+
+        if (have_radius == 0 || options->cylinder_radius <= 0.0) {
+          pe_fatal(pe,
+          "porous_media_cylinder_radius must be present and positive\n");
+        }
+      }
+      else if (strncmp(ptype, "solid_cylinder_yz", BUFSIZ) == 0) {
+
+        options->ndata = 0;
+        options->geometry = MAP_INIT_SOLID_CYLINDER_YZ;
+
+        int have_centre = rt_double_parameter_vector(
+            rt,
+            "porous_media_cylinder_center",
+            options->cylinder_centre);
+
+        int have_radius = rt_double_parameter(
+            rt,
+            "porous_media_cylinder_radius",
+            &options->cylinder_radius);
+
+        if (have_centre == 0) {
+            pe_fatal(pe,
+            "Key porous_media_cylinder_center expected but not present\n");
+        }
+
+        if (have_radius == 0 || options->cylinder_radius <= 0.0) {
+          pe_fatal(pe,
+          "porous_media_cylinder_radius must be present and positive\n");
+        }
+      }
+      else if (strncmp(ptype, "solid_cylinder_xz", BUFSIZ) == 0) {
+
+        options->ndata = 0;
+        options->geometry = MAP_INIT_SOLID_CYLINDER_XZ;
+
+        int have_centre = rt_double_parameter_vector(
+            rt,
+            "porous_media_cylinder_center",
+            options->cylinder_centre);
+
+        int have_radius = rt_double_parameter(
+            rt,
+            "porous_media_cylinder_radius",
+            &options->cylinder_radius);
+
+        if (have_centre == 0) {
+          pe_fatal(pe,
+          "Key porous_media_cylinder_center expected but not present\n");
+        }
+
+        if (have_radius == 0 || options->cylinder_radius <= 0.0) {
+          pe_fatal(pe,
+          "porous_media_cylinder_radius must be present and positive\n");
+        }
       }
       else if (strncmp(ptype, "square_xy", BUFSIZ) == 0) {
         options->ndata = 0;

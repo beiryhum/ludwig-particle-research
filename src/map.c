@@ -709,7 +709,10 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
   int ireal, ihalo;
   int icount, nsend;
   int pforw, pback;
+  int haveforw, haveback;
   int nlocal[3];
+  int periodic[3] = {0};
+  int cartsz[3] = {0};
   int nhcomm = 0;
 
   unsigned char * buf;
@@ -737,6 +740,8 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
   assert(sz != 0);
 
   cs_nlocal(cs, nlocal);
+  cs_periodic(cs, periodic);
+  cs_cartsz(cs, cartsz);
   cs_nhalo(cs, &nhcomm);
 
   /* X-direction */
@@ -777,19 +782,37 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
 
   assert(icount == nsend);
 
-  if (cs->param->mpi_cartsz[X] == 1) {
-    memcpy(recvback, sendforw, nsend*sz);
-    memcpy(recvforw, sendback, nsend*sz);
+    haveforw = 0;
+  haveback = 0;
+
+  if (cartsz[X] == 1) {
+
+    /*
+     * Single-rank direction wraps only when it is physically periodic.
+     * For a non-periodic direction, preserve the existing physical halo.
+     */
+    if (periodic[X]) {
+      memcpy(recvback, sendforw, nsend*sz);
+      memcpy(recvforw, sendback, nsend*sz);
+      haveforw = 1;
+      haveback = 1;
+    }
+
     req[2] = MPI_REQUEST_NULL;
     req[3] = MPI_REQUEST_NULL;
   }
   else {
     pforw = cs->mpi_cart_neighbours[CS_FORW][X];
     pback = cs->mpi_cart_neighbours[CS_BACK][X];
+
+    haveforw = (pforw != MPI_PROC_NULL);
+    haveback = (pback != MPI_PROC_NULL);
+
     MPI_Irecv(recvforw, nsend, mpidata, pforw, tagb, comm, req);
     MPI_Irecv(recvback, nsend, mpidata, pback, tagf, comm, req + 1);
     MPI_Issend(sendback, nsend, mpidata, pback, tagb, comm, req + 2);
     MPI_Issend(sendforw, nsend, mpidata, pforw, tagf, comm, req + 3);
+
     /* Wait for receives */
     MPI_Waitall(2, req, status);
   }
@@ -802,12 +825,17 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
     for (jc = 1; jc <= nlocal[Y]; jc++) {
       for (kc = 1; kc <= nlocal[Z]; kc++) {
 	for (ia = 0; ia < na; ia++) {
-	  index = cs_index(cs, nlocal[X] + 1 + nh, jc, kc);
-	  ihalo = addr_rank1(nall, na, index, ia);
-	  memcpy(buf + ihalo*sz, recvforw + icount*sz, sz);
-	  index = cs_index(cs, 0 - nh, jc, kc);
-	  ihalo = addr_rank1(nall, na, index, ia);
-	  memcpy(buf + ihalo*sz, recvback + icount*sz, sz);
+	  if (haveforw) {
+      index = cs_index(cs, nlocal[X] + 1 + nh, jc, kc);
+      ihalo = addr_rank1(nall, na, index, ia);
+      memcpy(buf + ihalo*sz, recvforw + icount*sz, sz);
+      }
+
+    if (haveback) {
+      index = cs_index(cs, 0 - nh, jc, kc);
+      ihalo = addr_rank1(nall, na, index, ia);
+      memcpy(buf + ihalo*sz, recvback + icount*sz, sz);
+      }
 	  icount += 1;
 	}
       }
@@ -860,19 +888,33 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
 
   assert(icount == nsend);
 
-  if (cs->param->mpi_cartsz[Y] == 1) {
-    memcpy(recvback, sendforw, nsend*sz);
-    memcpy(recvforw, sendback, nsend*sz);
+    haveforw = 0;
+  haveback = 0;
+
+  if (cartsz[Y] == 1) {
+
+    if (periodic[Y]) {
+      memcpy(recvback, sendforw, nsend*sz);
+      memcpy(recvforw, sendback, nsend*sz);
+      haveforw = 1;
+      haveback = 1;
+    }
+
     req[2] = MPI_REQUEST_NULL;
     req[3] = MPI_REQUEST_NULL;
   }
   else {
     pforw = cs->mpi_cart_neighbours[CS_FORW][Y];
     pback = cs->mpi_cart_neighbours[CS_BACK][Y];
+
+    haveforw = (pforw != MPI_PROC_NULL);
+    haveback = (pback != MPI_PROC_NULL);
+
     MPI_Irecv(recvforw, nsend, mpidata, pforw, tagb, comm, req);
     MPI_Irecv(recvback, nsend, mpidata, pback, tagf, comm, req + 1);
     MPI_Issend(sendback, nsend, mpidata, pback, tagb, comm, req + 2);
     MPI_Issend(sendforw, nsend, mpidata, pforw, tagf, comm, req + 3);
+
     /* Wait for receives */
     MPI_Waitall(2, req, status);
   }
@@ -885,12 +927,17 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
     for (ic = 1 - nhcomm; ic <= nlocal[X] + nhcomm; ic++) {
       for (kc = 1; kc <= nlocal[Z]; kc++) {
 	for (ia = 0; ia < na; ia++) {
-	  index = cs_index(cs, ic, 0 - nh, kc);
-	  ihalo = addr_rank1(nall, na, index, ia);
-	  memcpy(buf + ihalo*sz, recvback + icount*sz, sz);
-	  index = cs_index(cs, ic, nlocal[Y] + 1 + nh, kc);
-	  ihalo = addr_rank1(nall, na, index, ia);
-	  memcpy(buf + ihalo*sz, recvforw + icount*sz, sz);
+	            if (haveback) {
+            index = cs_index(cs, ic, 0 - nh, kc);
+            ihalo = addr_rank1(nall, na, index, ia);
+            memcpy(buf + ihalo*sz, recvback + icount*sz, sz);
+          }
+
+          if (haveforw) {
+            index = cs_index(cs, ic, nlocal[Y] + 1 + nh, kc);
+            ihalo = addr_rank1(nall, na, index, ia);
+            memcpy(buf + ihalo*sz, recvforw + icount*sz, sz);
+          }
 	  icount += 1;
 	}
       }
@@ -946,19 +993,33 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
 
   assert(icount == nsend);
 
-  if (cs->param->mpi_cartsz[Z] == 1) {
-    memcpy(recvback, sendforw, nsend*sz);
-    memcpy(recvforw, sendback, nsend*sz);
+    haveforw = 0;
+  haveback = 0;
+
+  if (cartsz[Z] == 1) {
+
+    if (periodic[Z]) {
+      memcpy(recvback, sendforw, nsend*sz);
+      memcpy(recvforw, sendback, nsend*sz);
+      haveforw = 1;
+      haveback = 1;
+    }
+
     req[2] = MPI_REQUEST_NULL;
     req[3] = MPI_REQUEST_NULL;
   }
   else {
     pforw = cs->mpi_cart_neighbours[CS_FORW][Z];
     pback = cs->mpi_cart_neighbours[CS_BACK][Z];
+
+    haveforw = (pforw != MPI_PROC_NULL);
+    haveback = (pback != MPI_PROC_NULL);
+
     MPI_Irecv(recvforw, nsend, mpidata, pforw, tagb, comm, req);
     MPI_Irecv(recvback, nsend, mpidata, pback, tagf, comm, req + 1);
     MPI_Issend(sendback, nsend, mpidata, pback, tagb, comm, req + 2);
     MPI_Issend(sendforw, nsend, mpidata, pforw, tagf, comm, req + 3);
+
     /* Wait before unloading */
     MPI_Waitall(2, req, status);
   }
@@ -971,12 +1032,16 @@ int map_halo_impl(cs_t * cs, int nall, int na, void * mbuf,
     for (ic = 1 - nhcomm; ic <= nlocal[X] + nhcomm; ic++) {
       for (jc = 1 - nhcomm; jc <= nlocal[Y] + nhcomm; jc++) {
 	for (ia = 0; ia < na; ia++) {
-	  index = cs_index(cs, ic, jc, 0 - nh);
-	  ihalo = addr_rank1(nall, na, index, ia);
-	  memcpy(buf + ihalo*sz, recvback + icount*sz, sz);
-	  index = cs_index(cs, ic, jc, nlocal[Z] + 1 + nh);
-	  ihalo = addr_rank1(nall, na, index, ia);
-	  memcpy(buf + ihalo*sz, recvforw + icount*sz, sz);
+	  if (haveback) {
+	    index = cs_index(cs, ic, jc, 0 - nh);
+	    ihalo = addr_rank1(nall, na, index, ia);
+	    memcpy(buf + ihalo*sz, recvback + icount*sz, sz);
+	  }
+	  if (haveforw) {
+	    index = cs_index(cs, ic, jc, nlocal[Z] + 1 + nh);
+	    ihalo = addr_rank1(nall, na, index, ia);
+	    memcpy(buf + ihalo*sz, recvforw + icount*sz, sz);
+	  }
 	  icount += 1;
 	}
       }

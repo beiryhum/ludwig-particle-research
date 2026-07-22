@@ -82,6 +82,10 @@ struct wall_s {
   int * linku;           /* Link wall_uw_enum_t (wall velocity) */
   double fnet[3];        /* Momentum accounting for source/sink walls */
 
+  int torque_active;     /* Link moment arms and torque accounting active */
+  double * linkr;        /* Link midpoint moment arm, 3*nlink */
+  double tnet[3];        /* Cumulative torque about the selected centre */
+
   int * linkk;           /* slip complementary fluid site index */
   int8_t * linkq;        /* slip complementary link index (out from k) */
   int8_t * links;        /* Fraction of slip (0 = no slip, 1 = free slip) */
@@ -108,6 +112,8 @@ __host__ int wall_lubr_sphere(wall_t * wall,  double ah, const double r[3],
 			      double  drag[3]);
 __host__ int wall_momentum(wall_t * wall, double g[3]);
 __host__ int wall_momentum_add(wall_t * wall, const double g[3]);
+__host__ int wall_torque_center_set(wall_t * wall, const double centre[3]);
+__host__ int wall_torque(wall_t * wall, double t[3]);
 
 __host__ __device__ int wall_is_pm(wall_t * wall, int * ispm);
 __host__ __device__ int wall_present(wall_t * wall);

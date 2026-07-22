@@ -23,6 +23,12 @@ __host__ int map_init_status_circle_xy(map_t * map);
 __host__ int map_init_status_circle_yz(map_t * map);
 __host__ int map_init_status_circle_xz(map_t * map);
 
+__host__ int map_init_status_solid_cylinder(
+    map_t * map,
+    int axis,
+    const double centre[3],
+    double radius);
+
 __host__ int map_init_status_wall(map_t * map, int idim);
 __host__ int map_init_status_simple_cubic(map_t * map, int acell);
 __host__ int map_init_status_body_centred_cubic(map_t * map, int acell);

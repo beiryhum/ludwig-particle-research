@@ -257,6 +257,92 @@ int map_init_status_circle_xz(map_t * map) {
 
 /*****************************************************************************
  *
+ *  map_init_status_solid_cylinder
+ *
+ *  axis = X: cylinder axis x, circular section yz
+ *  axis = Y: cylinder axis y, circular section xz
+ *  axis = Z: cylinder axis z, circular section xy
+ *
+ *****************************************************************************/
+
+__host__ int map_init_status_solid_cylinder(
+    map_t * map,
+    int axis,
+    const double centre[3],
+    double radius) {
+
+  int nlocal[3] = {0};
+  int noffset[3] = {0};
+
+  cs_t * cs = NULL;
+
+  assert(map);
+  assert(centre);
+  assert(axis == X || axis == Y || axis == Z);
+  assert(radius > 0.0);
+
+  cs = map->cs;
+
+  cs_nlocal(cs, nlocal);
+  cs_nlocal_offset(cs, noffset);
+
+  /*
+   * The two transverse directions.
+   *
+   * axis X -> Y,Z
+   * axis Y -> Z,X
+   * axis Z -> X,Y
+   */
+
+  int t1 = (axis + 1) % 3;
+  int t2 = (axis + 2) % 3;
+
+  for (int ic = 1; ic <= nlocal[X]; ic++) {
+    for (int jc = 1; jc <= nlocal[Y]; jc++) {
+      for (int kc = 1; kc <= nlocal[Z]; kc++) {
+
+        double x[3] = {
+          noffset[X] + ic,
+          noffset[Y] + jc,
+          noffset[Z] + kc
+        };
+
+        double d1 = x[t1] - centre[t1];
+        double d2 = x[t2] - centre[t2];
+        double r2 = d1*d1 + d2*d2;
+
+        int index = cs_index(cs, ic, jc, kc);
+
+        /*
+         * External-flow geometry:
+         * outside cylinder = fluid;
+         * inside cylinder  = solid boundary.
+         */
+
+        int status = MAP_FLUID;
+
+        if (r2 <= radius*radius) {
+          status = MAP_BOUNDARY;
+        }
+
+        map_status_set(map, index, status);
+      }
+    }
+  }
+
+  /*
+   * Tell the subsequent wall initialisation that the map contains
+   * porous-media solid sites.
+   */
+
+  map_pm_set(map, 1);
+
+  return 0;
+}
+
+
+/*****************************************************************************
+ *
  *  map_init_status_wall
  *
  *  Initialise boundary at L = 1 and L = L in given direction.

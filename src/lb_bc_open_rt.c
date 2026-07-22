@@ -54,41 +54,88 @@ __host__ int lb_bc_open_rt(pe_t * pe, rt_t * rt, cs_t * cs, lb_t * lb,
 
   have_bc = rt_switch(rt, "lb_bc_open");
 
-  if (have_bc) {
+    if (have_bc) {
     int wall[3] = {0};
     int periodic[3] = {0};
-
-    /* Take flow direction from non-wall direction. */
-    /* There must be D-1 walls in D dimensions */
+    int nflow = 0;
+    int id = -1;
 
     rt_int_parameter_vector(rt, "boundary_walls", wall);
-    flow[X] = 1 - wall[X];
-    flow[Y] = 1 - wall[Y];
-    flow[Z] = 1 - wall[Z];
-
-    if (lb_bc_inflow_opts_flow_valid(flow) == 0) {
-      pe_fatal(pe, "Inflow/outflow requires exactly one-non wall direction\n");
-    }
-
-    /* Temporarily override this while only x-direction halo swap
-     * implementation in available. */
-
-    if (pe_mpi_size(pe) > 1 && (flow[Y] != 0 || flow[Z] != 0)) {
-      pe_fatal(pe, "Open boundary condition direction must be X\n");
-    }
-    
-    /* Test periodicity. Must be (0,0,0). */
-
     cs_periodic(cs, periodic);
-    if (periodic[X] || periodic[Y] || periodic[Z]) {
-      pe_fatal(pe, "Inflow/outflow requires fully non-periodic system\n");
+
+    /*
+     * Prefer an explicitly supplied open-flow direction.
+     * Retain the old wall-based inference as a fallback for existing
+     * fully walled channel inputs.
+     */
+    nflow = rt_int_parameter_vector(rt, "lb_bc_open_flow", flow);
+
+    if (nflow == 0) {
+      flow[X] = 1 - wall[X];
+      flow[Y] = 1 - wall[Y];
+      flow[Z] = 1 - wall[Z];
     }
 
-    /* Any  other checks are deferred ... */
+    /*
+     * Exactly one coordinate direction must be the open-flow direction.
+     */
+    if (lb_bc_inflow_opts_flow_valid(flow) == 0) {
+      pe_fatal(pe,
+               "Inflow/outflow requires exactly one open-flow direction\n");
+    }
+
+    for (int ia = 0; ia < 3; ia++) {
+      if (flow[ia]) id = ia;
+    }
+
+    assert(id == X || id == Y || id == Z);
+
+    /*
+     * The streamwise direction must be open:
+     * it cannot simultaneously be a wall or periodic.
+     */
+    if (wall[id]) {
+      pe_fatal(pe,
+               "Open-flow direction cannot also contain boundary walls\n");
+    }
+
+    if (periodic[id]) {
+      pe_fatal(pe,
+               "Open-flow direction cannot be periodic\n");
+    }
+
+    /*
+     * Each transverse direction must be either:
+     *
+     *   (a) bounded by physical walls; or
+     *   (b) periodic.
+     *
+     * It cannot be both and cannot be neither.
+     */
+    for (int ia = 0; ia < 3; ia++) {
+
+      if (ia == id) continue;
+
+      if (wall[ia] && periodic[ia]) {
+        pe_fatal(pe,
+                 "A transverse direction cannot be both wall and periodic\n");
+      }
+
+      if (!wall[ia] && !periodic[ia]) {
+        pe_fatal(pe,
+                 "Each transverse direction must be wall or periodic\n");
+      }
+    }
 
     rt_key_required(rt, "lb_bc_inflow_type",  RT_INFO);
     rt_key_required(rt, "lb_bc_outflow_type", RT_INFO);
   }
+
+    /* X, Y, and Z flow directions are supported in serial and MPI. */
+
+    /* Test periodicity. Must be (0,0,0). */
+
+    
   
   /* Inflow */
 

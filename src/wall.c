@@ -132,6 +132,12 @@ __host__ int wall_free(wall_t * wall) {
 			   tdpMemcpyDeviceToHost) );
       tdpAssert( tdpFree(tmp) );
     }
+    {
+      double * tmp = NULL;
+      tdpAssert( tdpMemcpy(&tmp, &wall->target->linkr, sizeof(double *),
+			   tdpMemcpyDeviceToHost) );
+      tdpAssert( tdpFree(tmp) );
+    }
     /* Release slip stuff */
     if (wall->param->slip.active) {
       int * tmp = NULL;
@@ -164,6 +170,7 @@ __host__ int wall_free(wall_t * wall) {
   free(wall->linkj);
   free(wall->linkp);
   free(wall->linku);
+  free(wall->linkr);
 
   free(wall);
 
@@ -184,6 +191,13 @@ __host__ int wall_commit(wall_t * wall, wall_param_t * param) {
   *wall->param = *param;
 
   wall_init_map(wall);
+
+  /*
+   * wall_init_map() may change physical map status after the porous-media
+   * geometry halo exchange. Refresh map halos before constructing links.
+   */
+  map_halo(wall->map);
+
   wall_init_boundaries(wall, WALL_INIT_COUNT_ONLY);
   wall_init_boundaries(wall, WALL_INIT_ALLOCATE);
   wall_init_boundaries_slip(wall);
@@ -239,7 +253,8 @@ __host__ int wall_info(wall_t * wall) {
     }
 
     pe_info(pe, "Wall boundary links allocated:   %d\n",  nlink);
-    pe_info(pe, "Memory (total, bytes):           %zu\n", 4*nlink*sizeof(int));
+    pe_info(pe, "Memory (total, bytes):           %zu\n",
+	    4*nlink*sizeof(int) + 3*nlink*sizeof(double));
     pe_info(pe, "Boundary shear initialise:       %d\n",
 	    wall->param->initshear);
   }
@@ -263,7 +278,8 @@ __host__ int wall_info(wall_t * wall) {
     pe_info(pe, "Porous Media\n");
     pe_info(pe, "------------\n");
     pe_info(pe, "Wall boundary links allocated:   %d\n",  nlink);
-    pe_info(pe, "Memory (total, bytes):           %zu\n", 4*nlink*sizeof(int));
+    pe_info(pe, "Memory (total, bytes):           %zu\n",
+	    4*nlink*sizeof(int) + 3*nlink*sizeof(double));
   }
 
   return 0;
@@ -412,14 +428,17 @@ __host__ int wall_init_boundaries(wall_t * wall, wall_init_enum_t init) {
     wall->linkj = (int *) calloc(nlink, sizeof(int));
     wall->linkp = (int *) calloc(nlink, sizeof(int));
     wall->linku = (int *) calloc(nlink, sizeof(int));
+    wall->linkr = (double *) calloc(3*nlink, sizeof(double));
     assert(wall->linki);
     assert(wall->linkj);
     assert(wall->linkp);
     assert(wall->linku);
+    assert(wall->linkr);
     if (wall->linki == NULL) pe_fatal(wall->pe,"calloc(wall->linki) failed\n");
     if (wall->linkj == NULL) pe_fatal(wall->pe,"calloc(wall->linkj) failed\n");
     if (wall->linkp == NULL) pe_fatal(wall->pe,"calloc(wall->linkp) failed\n");
     if (wall->linku == NULL) pe_fatal(wall->pe,"calloc(wall->linku) failed\n");
+    if (wall->linkr == NULL) pe_fatal(wall->pe,"calloc(wall->linkr) failed\n");
     if (ndevice > 0) {
       int tmp;
       tdpAssert( tdpMalloc((void **) &tmp, wall->nlink*sizeof(int)) );
@@ -435,11 +454,17 @@ __host__ int wall_init_boundaries(wall_t * wall, wall_init_enum_t init) {
       tdpAssert( tdpMemcpy(&wall->target->linku, &tmp, sizeof(int *),
 			   tdpMemcpyHostToDevice) );
     }
+    if (ndevice > 0) {
+      double * tmp = NULL;
+      tdpAssert( tdpMalloc((void **) &tmp, 3*nlink*sizeof(double)) );
+      tdpAssert( tdpMemcpy(&wall->target->linkr, &tmp, sizeof(double *),
+			   tdpMemcpyHostToDevice) );
+    }
   }
 
   nlink = 0;
   cs_nlocal(wall->cs, nlocal);
-
+  
   for (ic = 1; ic <= nlocal[X]; ic++) {
     for (jc = 1; jc <= nlocal[Y]; jc++) {
       for (kc = 1; kc <= nlocal[Z]; kc++) {
@@ -821,6 +846,10 @@ __host__ int wall_memcpy_h2d(wall_t * wall) {
 		      tdpMemcpyHostToDevice));
   tdpAssert(tdpMemcpy(wall->target->fnet, wall->fnet, 3*sizeof(double),
 		      tdpMemcpyHostToDevice));
+  tdpAssert(tdpMemcpy(&wall->target->torque_active, &wall->torque_active,
+		      sizeof(int), tdpMemcpyHostToDevice));
+  tdpAssert(tdpMemcpy(wall->target->tnet, wall->tnet, 3*sizeof(double),
+		      tdpMemcpyHostToDevice));
 
   /* In turn, linki, linkj, linkp, linku */
   tdpAssert(tdpMemcpy(&tmp, &wall->target->linki, sizeof(int *),
@@ -842,6 +871,14 @@ __host__ int wall_memcpy_h2d(wall_t * wall) {
 		      tdpMemcpyDeviceToHost));
   tdpAssert(tdpMemcpy(tmp, wall->linku, nlink*sizeof(int),
 		      tdpMemcpyHostToDevice));
+
+  {
+    double * tmpd = NULL;
+    tdpAssert(tdpMemcpy(&tmpd, &wall->target->linkr, sizeof(double *),
+			tdpMemcpyDeviceToHost));
+    tdpAssert(tdpMemcpy(tmpd, wall->linkr, 3*nlink*sizeof(double),
+			tdpMemcpyHostToDevice));
+  }
 
   /* Slip stuff k, q, s ... */
   if (wall->param->slip.active) {
@@ -1012,11 +1049,15 @@ __global__ void wall_bbl_kernel(wall_t * wall, lb_t * lb, map_t * map) {
   int ib;
   int tid;
   double fxb, fyb, fzb;
+  double txb, tyb, tzb;
   double uw[WALL_UWMAX][3];
 
   __shared__ double fx[TARGET_MAX_THREADS_PER_BLOCK];
   __shared__ double fy[TARGET_MAX_THREADS_PER_BLOCK];
   __shared__ double fz[TARGET_MAX_THREADS_PER_BLOCK];
+  __shared__ double tx[TARGET_MAX_THREADS_PER_BLOCK];
+  __shared__ double ty[TARGET_MAX_THREADS_PER_BLOCK];
+  __shared__ double tz[TARGET_MAX_THREADS_PER_BLOCK];
 
   LB_RCS2_DOUBLE(rcs2);
 
@@ -1037,6 +1078,9 @@ __global__ void wall_bbl_kernel(wall_t * wall, lb_t * lb, map_t * map) {
   fx[tid] = 0.0;
   fy[tid] = 0.0;
   fz[tid] = 0.0;
+  tx[tid] = 0.0;
+  ty[tid] = 0.0;
+  tz[tid] = 0.0;
 
   for_simt_parallel(n, wall->nlink, 1) {
 
@@ -1045,6 +1089,9 @@ __global__ void wall_bbl_kernel(wall_t * wall, lb_t * lb, map_t * map) {
     double rho, cdotu;
     double fp, fp0, fp1;
     double force;
+    double dfx = 0.0;
+    double dfy = 0.0;
+    double dfz = 0.0;
 
     i  = wall->linki[n];         /* fluid */
     j  = wall->linkj[n];         /* solid */
@@ -1067,9 +1114,13 @@ __global__ void wall_bbl_kernel(wall_t * wall, lb_t * lb, map_t * map) {
       lb_f(lb, j, ji, LB_RHO, &fp1);
       fp = fp0 + fp1;
 
-      fx[tid] += (fp - 2.0*lb->param->wv[ij])*lb->param->cv[ij][X];
-      fy[tid] += (fp - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Y];
-      fz[tid] += (fp - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Z];
+      dfx = (fp - 2.0*lb->param->wv[ij])*lb->param->cv[ij][X];
+      dfy = (fp - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Y];
+      dfz = (fp - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Z];
+
+      fx[tid] += dfx;
+      fy[tid] += dfy;
+      fz[tid] += dfz;
     }
     else {
 
@@ -1083,9 +1134,13 @@ __global__ void wall_bbl_kernel(wall_t * wall, lb_t * lb, map_t * map) {
 
       force = 2.0*fp - 2.0*rcs2*lb->param->wv[ij]*lb->param->rho0*cdotu;
 
-      fx[tid] += (force - 2.0*lb->param->wv[ij])*lb->param->cv[ij][X];
-      fy[tid] += (force - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Y];
-      fz[tid] += (force - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Z];
+      dfx = (force - 2.0*lb->param->wv[ij])*lb->param->cv[ij][X];
+      dfy = (force - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Y];
+      dfz = (force - 2.0*lb->param->wv[ij])*lb->param->cv[ij][Z];
+
+      fx[tid] += dfx;
+      fy[tid] += dfy;
+      fz[tid] += dfz;
 
       fp = fp - 2.0*rcs2*lb->param->wv[ij]*lb->param->rho0*cdotu;
       lb_f_set(lb, j, ji, LB_RHO, fp);
@@ -1099,19 +1154,39 @@ __global__ void wall_bbl_kernel(wall_t * wall, lb_t * lb, map_t * map) {
 	lb_f_set(lb, j, ji, LB_PHI, fp);
       }
     }
+
+    if (wall->torque_active) {
+      double rx = wall->linkr[3*n + X];
+      double ry = wall->linkr[3*n + Y];
+      double rz = wall->linkr[3*n + Z];
+
+      tx[tid] += ry*dfz - rz*dfy;
+      ty[tid] += rz*dfx - rx*dfz;
+      tz[tid] += rx*dfy - ry*dfx;
+    }
+
     /* Next link */
   }
 
-  /* Reduction for momentum transfer */
+  /* Reduction for momentum and torque transfer */
 
   fxb = tdpAtomicBlockAddDouble(fx);
   fyb = tdpAtomicBlockAddDouble(fy);
   fzb = tdpAtomicBlockAddDouble(fz);
+  txb = tdpAtomicBlockAddDouble(tx);
+  tyb = tdpAtomicBlockAddDouble(ty);
+  tzb = tdpAtomicBlockAddDouble(tz);
 
   if (tid == 0) {
     tdpAtomicAddDouble(&wall->fnet[X], fxb);
     tdpAtomicAddDouble(&wall->fnet[Y], fyb);
     tdpAtomicAddDouble(&wall->fnet[Z], fzb);
+
+    if (wall->torque_active) {
+      tdpAtomicAddDouble(&wall->tnet[X], txb);
+      tdpAtomicAddDouble(&wall->tnet[Y], tyb);
+      tdpAtomicAddDouble(&wall->tnet[Z], tzb);
+    }
   }
 
   return;
@@ -1341,6 +1416,112 @@ __host__ int wall_momentum(wall_t * wall, double f[3]) {
   f[X] = wall->fnet[X];
   f[Y] = wall->fnet[Y];
   f[Z] = wall->fnet[Z];
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  wall_torque_center_set
+ *
+ *  Precompute the moment arm from the requested centre to each nominal
+ *  halfway bounce-back point. Global lattice coordinates are used, with
+ *  minimum-image wrapping in periodic directions.
+ *
+ *****************************************************************************/
+
+__host__ int wall_torque_center_set(wall_t * wall, const double centre[3]) {
+
+  int noffset[3] = {0};
+  int ntotal[3] = {0};
+  int periodic[3] = {0};
+
+  assert(wall);
+  assert(centre);
+  assert(wall->linkr);
+
+  if (wall->param->slip.active) {
+    pe_fatal(wall->pe,
+             "Cylinder torque output currently requires no-slip links\n");
+  }
+
+  
+  cs_nlocal_offset(wall->cs, noffset);
+  cs_ntotal(wall->cs, ntotal);
+  cs_periodic(wall->cs, periodic);
+
+  wall->tnet[X] = 0.0;
+  wall->tnet[Y] = 0.0;
+  wall->tnet[Z] = 0.0;
+
+  for (int n = 0; n < wall->nlink; n++) {
+
+    int ijk[3] = {0};
+    int p = wall->linkp[n];
+
+    cs_index_to_ijk(wall->cs, wall->linki[n], ijk);
+
+    for (int ia = 0; ia < 3; ia++) {
+
+      double xmid =
+        noffset[ia] + ijk[ia] + 0.5*wall->lb->model.cv[p][ia];
+
+      double r = xmid - centre[ia];
+
+      if (periodic[ia]) {
+        double ltot = (double) ntotal[ia];
+        r -= round(r/ltot)*ltot;
+      }
+
+      wall->linkr[3*n + ia] = r;
+    }
+  }
+
+  wall->torque_active = 1;
+
+  wall_memcpy(wall, tdpMemcpyHostToDevice);
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  wall_torque
+ *
+ *  Return the cumulative local torque about the centre supplied via
+ *  wall_torque_center_set(). The caller is responsible for MPI reduction.
+ *
+ *****************************************************************************/
+
+__host__ int wall_torque(wall_t * wall, double t[3]) {
+
+  int ndevice;
+  double ttmp[3] = {0.0, 0.0, 0.0};
+
+  assert(wall);
+  assert(t);
+
+  tdpAssert( tdpGetDeviceCount(&ndevice) );
+
+  if (ndevice > 0) {
+    tdpAssert( tdpMemcpy(ttmp, wall->target->tnet, 3*sizeof(double),
+                         tdpMemcpyDeviceToHost) );
+
+    wall->tnet[X] += ttmp[X];
+    wall->tnet[Y] += ttmp[Y];
+    wall->tnet[Z] += ttmp[Z];
+
+    ttmp[X] = 0.0;
+    ttmp[Y] = 0.0;
+    ttmp[Z] = 0.0;
+
+    tdpAssert( tdpMemcpy(wall->target->tnet, ttmp, 3*sizeof(double),
+                         tdpMemcpyHostToDevice) );
+  }
+
+  t[X] = wall->tnet[X];
+  t[Y] = wall->tnet[Y];
+  t[Z] = wall->tnet[Z];
 
   return 0;
 }

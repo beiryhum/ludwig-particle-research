@@ -176,11 +176,37 @@ struct ludwig_s {
   stats_rheo_t * stat_rheo;    /* Rheology diagnostics */
   stats_turb_t * stat_turb;    /* Turbulent diagnostics */
   timekeeper_t tk;             /* Time keeper */
+
+  /* Optional +X outlet momentum sponge */
+  int outlet_sponge;
+  int outlet_sponge_length;
+  double outlet_sponge_strength;
+  double outlet_sponge_u_ref[3];
+
+  /* Fixed-cylinder force time series */
+  int cylinder_force_output;
+  int cylinder_force_freq;
+  int cylinder_force_flush_freq;
+  int cylinder_force_output_count;
+  int cylinder_force_have_previous;
+  int cylinder_force_previous_step;
+  double cylinder_force_rho_ref;
+  double cylinder_force_u_ref;
+  double cylinder_force_d_ref;
+  double cylinder_force_span_ref;
+  double cylinder_force_previous_gwall[3];
+  double cylinder_force_previous_twall[3];
+  FILE * cylinder_force_fp;
 };
 
 static int ludwig_rt(ludwig_t * ludwig);
-static int ludwig_report_momentum(ludwig_t * ludwig);
+static int ludwig_report_momentum(ludwig_t * ludwig, int itimestep);
 static int ludwig_report_statistics(ludwig_t * ludwig, int itimestep);
+static int ludwig_outlet_sponge_init(ludwig_t * ludwig);
+static int ludwig_outlet_sponge_apply(ludwig_t * ludwig);
+static int ludwig_cylinder_force_init(ludwig_t * ludwig);
+static int ludwig_cylinder_force_write(ludwig_t * ludwig, int itimestep);
+static int ludwig_cylinder_force_finish(ludwig_t * ludwig);
 static int ludwig_colloids_update(ludwig_t * ludwig);
 static int ludwig_colloids_update_low_freq(ludwig_t * ludwig);
 
@@ -244,6 +270,7 @@ static int ludwig_rt(ludwig_t * ludwig) {
 
   lb_bc_open_rt(pe, rt, cs, ludwig->lb, &ludwig->inflow, &ludwig->outflow);
   phi_bc_open_rt(pe, rt, cs, &ludwig->phi_inflow, &ludwig->phi_outflow);
+  ludwig_outlet_sponge_init(ludwig);
 
   if (ludwig->phi || ludwig->p || ludwig->q) {
     advection_init_rt(pe, rt);
@@ -272,6 +299,8 @@ static int ludwig_rt(ludwig_t * ludwig) {
   }
 
   wall_rt_init(pe, cs, rt, ludwig->lb, ludwig->map, &ludwig->wall);
+  ludwig_cylinder_force_init(ludwig);
+
   colloids_init_rt(pe, rt, cs, &ludwig->collinfo, &ludwig->cio,
 		   &ludwig->interact, ludwig->wall, ludwig->map,
 		   &ludwig->lb->model);
@@ -515,7 +544,7 @@ void ludwig_run(const char * inputfile) {
   wall_is_pm(ludwig->wall, &is_porous_media);
 
   ludwig_report_statistics(ludwig, 0);
-  ludwig_report_momentum(ludwig);
+  ludwig_report_momentum(ludwig, 0);
 
   /* Main time stepping loop */
 
@@ -783,6 +812,12 @@ void ludwig_run(const char * inputfile) {
 
     if (ludwig->hydro) {
 
+      /*
+       * Add the optional outlet damping force after all physical force
+       * contributions have been assembled and before collision.
+       */
+      ludwig_outlet_sponge_apply(ludwig);
+
       /* Zero velocity field here, as velocity at collision is used
        * at next time step for FD above. Strictly, we only need to
        * do this if velocity output is required in presence of
@@ -855,6 +890,8 @@ void ludwig_run(const char * inputfile) {
 			   ludwig->collinfo);
       wall_bbl(ludwig->wall);
       TIMER_stop(TIMER_BBL);
+
+      ludwig_cylinder_force_write(ludwig, step);
     }
     else {
       /* No hydrodynamics, but update colloids in response to
@@ -992,7 +1029,7 @@ void ludwig_run(const char * inputfile) {
     if (is_statistics_step()) {
 
       ludwig_report_statistics(ludwig, step);
-      ludwig_report_momentum(ludwig);
+      ludwig_report_momentum(ludwig, step);
 
       if (ludwig->hydro) {
 	wall_is_pm(ludwig->wall, &is_pm);
@@ -1044,6 +1081,8 @@ void ludwig_run(const char * inputfile) {
   if (ludwig->interact) interact_free(ludwig->interact);
   if (ludwig->cio)      colloid_io_free(ludwig->cio);
 
+  ludwig_cylinder_force_finish(ludwig);
+
   if (ludwig->wall)      wall_free(ludwig->wall);
 #ifdef OLD_SHIT
   if (ludwig->noise_phi) noise_free(ludwig->noise_phi);
@@ -1078,29 +1117,682 @@ void ludwig_run(const char * inputfile) {
 
 /*****************************************************************************
  *
+ *  ludwig_outlet_sponge_kernel
+ *
+ *  Add a smooth momentum-relaxation force in the final part of a +X open
+ *  domain. The local damping coefficient is
+ *
+ *    sigma(x) = sigma_max s^2 (3 - 2s),  0 <= s <= 1,
+ *
+ *  and the force density is
+ *
+ *    f_sponge = -rho sigma(x) [u - u_ref].
+ *
+ *  The smoothstep ramp has zero slope at both ends and avoids introducing
+ *  a sharp artificial interface at the sponge entrance.
+ *
+ *****************************************************************************/
+
+__global__ void ludwig_outlet_sponge_kernel(kernel_3d_t k3d,
+                                             hydro_t * hydro,
+                                             map_t * map,
+                                             int noffset_x,
+                                             int ntotal_x,
+                                             int length,
+                                             double strength,
+                                             double ux_ref,
+                                             double uy_ref,
+                                             double uz_ref) {
+
+  int kindex = 0;
+
+  for_simt_parallel(kindex, k3d.kiterations, 1) {
+
+    int ic = kernel_3d_ic(&k3d, kindex);
+    int jc = kernel_3d_jc(&k3d, kindex);
+    int kc = kernel_3d_kc(&k3d, kindex);
+    int index = kernel_3d_cs_index(&k3d, ic, jc, kc);
+
+    int ig = noffset_x + ic;
+    int istart = ntotal_x - length + 1;
+
+    if (ig >= istart) {
+
+      int status = MAP_FLUID;
+      map_status(map, index, &status);
+
+      if (status == MAP_FLUID) {
+
+        double s = 1.0;
+        double sigma = 0.0;
+        double rho = 0.0;
+        double u[3] = {0.0, 0.0, 0.0};
+        double force[3] = {0.0, 0.0, 0.0};
+
+        if (length > 1) {
+          s = (double) (ig - istart)/(double) (length - 1);
+        }
+
+        if (s < 0.0) s = 0.0;
+        if (s > 1.0) s = 1.0;
+
+        sigma = strength*s*s*(3.0 - 2.0*s);
+
+        hydro_rho(hydro, index, &rho);
+        hydro_u(hydro, index, u);
+
+        force[X] = -rho*sigma*(u[X] - ux_ref);
+        force[Y] = -rho*sigma*(u[Y] - uy_ref);
+        force[Z] = -rho*sigma*(u[Z] - uz_ref);
+
+        hydro_f_local_add(hydro, index, force);
+      }
+    }
+  }
+
+  return;
+}
+
+/*****************************************************************************
+ *
+ *  ludwig_outlet_sponge_init
+ *
+ *  Runtime initialisation for an optional +X outlet momentum sponge.
+ *  The feature is off by default and therefore leaves all existing inputs
+ *  unchanged.
+ *
+ *****************************************************************************/
+
+static int ludwig_outlet_sponge_init(ludwig_t * ludwig) {
+
+  int flow[3] = {0, 0, 0};
+  int ntotal[3] = {0, 0, 0};
+  int periodic[3] = {0, 0, 0};
+  int have_u_ref = 0;
+
+  assert(ludwig);
+  assert(ludwig->rt);
+  assert(ludwig->cs);
+
+  ludwig->outlet_sponge =
+    rt_switch(ludwig->rt, "outlet_sponge");
+
+  if (!ludwig->outlet_sponge) return 0;
+
+  if (ludwig->hydro == NULL) {
+    pe_fatal(ludwig->pe, "outlet_sponge requires hydrodynamics on\n");
+  }
+
+  if (ludwig->inflow == NULL || ludwig->outflow == NULL) {
+    pe_fatal(ludwig->pe,
+             "outlet_sponge requires lb_bc_open on with inflow/outflow\n");
+  }
+
+  rt_int_parameter_vector(ludwig->rt, "lb_bc_open_flow", flow);
+
+  if (flow[X] != 1 || flow[Y] != 0 || flow[Z] != 0) {
+    pe_fatal(ludwig->pe,
+             "outlet_sponge currently supports +X open flow only\n");
+  }
+
+  cs_periodic(ludwig->cs, periodic);
+
+  if (periodic[X]) {
+    pe_fatal(ludwig->pe,
+             "outlet_sponge requires a non-periodic X direction\n");
+  }
+
+  ludwig->outlet_sponge_length = 0;
+  ludwig->outlet_sponge_strength = 0.0;
+
+  rt_int_parameter(ludwig->rt, "outlet_sponge_length",
+                   &ludwig->outlet_sponge_length);
+
+  rt_double_parameter(ludwig->rt, "outlet_sponge_strength",
+                      &ludwig->outlet_sponge_strength);
+
+  /*
+   * Default the relaxation target to the uniform inflow velocity. An
+   * explicitly supplied outlet_sponge_u_ref overrides this value.
+   */
+  rt_double_parameter_vector(ludwig->rt, "lb_bc_inflow_rhou_u0",
+                             ludwig->outlet_sponge_u_ref);
+
+  have_u_ref = rt_double_parameter_vector(
+      ludwig->rt, "outlet_sponge_u_ref", ludwig->outlet_sponge_u_ref);
+
+  cs_ntotal(ludwig->cs, ntotal);
+
+  if (ludwig->outlet_sponge_length <= 1 ||
+      ludwig->outlet_sponge_length >= ntotal[X]) {
+    pe_fatal(ludwig->pe,
+             "outlet_sponge_length must satisfy 1 < length < size[X]\n");
+  }
+
+  if (ludwig->outlet_sponge_strength <= 0.0 ||
+      ludwig->outlet_sponge_strength > 1.0) {
+    pe_fatal(ludwig->pe,
+             "outlet_sponge_strength must satisfy 0 < strength <= 1\n");
+  }
+
+  pe_info(ludwig->pe, "\n");
+  pe_info(ludwig->pe, "Outlet momentum sponge\n");
+  pe_info(ludwig->pe, "----------------------\n");
+  pe_info(ludwig->pe, "Flow direction:           +X\n");
+  pe_info(ludwig->pe, "Global X range:           %d to %d\n",
+          ntotal[X] - ludwig->outlet_sponge_length + 1, ntotal[X]);
+  pe_info(ludwig->pe, "Length:                   %d\n",
+          ludwig->outlet_sponge_length);
+  pe_info(ludwig->pe, "Maximum strength:       %14.7e\n",
+          ludwig->outlet_sponge_strength);
+  pe_info(ludwig->pe, "Reference velocity:     %14.7e %14.7e %14.7e%s\n",
+          ludwig->outlet_sponge_u_ref[X],
+          ludwig->outlet_sponge_u_ref[Y],
+          ludwig->outlet_sponge_u_ref[Z],
+          have_u_ref ? " (user supplied)" : " (inflow default)");
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  ludwig_outlet_sponge_apply
+ *
+ *****************************************************************************/
+
+static int ludwig_outlet_sponge_apply(ludwig_t * ludwig) {
+
+  int nlocal[3] = {0, 0, 0};
+  int noffset[3] = {0, 0, 0};
+  int ntotal[3] = {0, 0, 0};
+
+  assert(ludwig);
+
+  if (!ludwig->outlet_sponge) return 0;
+
+  cs_nlocal(ludwig->cs, nlocal);
+  cs_nlocal_offset(ludwig->cs, noffset);
+  cs_ntotal(ludwig->cs, ntotal);
+
+  {
+    dim3 nblk = {};
+    dim3 ntpb = {};
+    cs_limits_t lim = {1, nlocal[X], 1, nlocal[Y], 1, nlocal[Z]};
+    kernel_3d_t k3d = kernel_3d(ludwig->cs, lim);
+
+    kernel_3d_launch_param(k3d.kiterations, &nblk, &ntpb);
+
+    tdpLaunchKernel(ludwig_outlet_sponge_kernel, nblk, ntpb, 0, 0,
+                    k3d, ludwig->hydro->target, ludwig->map->target,
+                    noffset[X], ntotal[X],
+                    ludwig->outlet_sponge_length,
+                    ludwig->outlet_sponge_strength,
+                    ludwig->outlet_sponge_u_ref[X],
+                    ludwig->outlet_sponge_u_ref[Y],
+                    ludwig->outlet_sponge_u_ref[Z]);
+
+    tdpAssert(tdpPeekAtLastError());
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  ludwig_cylinder_force_init
+ *
+ *  Initialise a time series of the force on a fixed porous-media cylinder.
+ *  This diagnostic is valid only when there are no external flat walls, so
+ *  the wall momentum contains the cylinder contribution alone.
+ *
+ *****************************************************************************/
+
+static int ludwig_cylinder_force_init(ludwig_t * ludwig) {
+
+  int is_pm = 0;
+  int have_walls = 0;
+  int rank = 0;
+  int ntstep = 0;
+  int have_centre = 0;
+  int have_torque_centre = 0;
+
+  double centre[3] = {0.0, 0.0, 0.0};
+  double torque_centre[3] = {0.0, 0.0, 0.0};
+
+  char filename[FILENAME_MAX] = "cylinder_force_torque.csv";
+
+  MPI_Comm comm = MPI_COMM_NULL;
+  pe_t * pe = NULL;
+
+  assert(ludwig);
+  assert(ludwig->wall);
+
+  pe = ludwig->pe;
+  pe_mpi_comm(pe, &comm);
+  MPI_Comm_rank(comm, &rank);
+
+  ludwig->cylinder_force_output =
+    rt_switch(ludwig->rt, "cylinder_force_output");
+
+  if (!ludwig->cylinder_force_output) return 0;
+
+  wall_is_pm(ludwig->wall, &is_pm);
+  have_walls = wall_present(ludwig->wall);
+
+  if (!is_pm) {
+    pe_fatal(pe, "cylinder_force_output requires porous media\n");
+  }
+
+  if (have_walls) {
+    pe_fatal(pe,
+             "cylinder_force_output currently requires "
+             "boundary_walls 0_0_0\n");
+  }
+
+  physics_rho0(ludwig->phys, &ludwig->cylinder_force_rho_ref);
+
+  rt_double_parameter(ludwig->rt, "cylinder_force_u_ref",
+                      &ludwig->cylinder_force_u_ref);
+
+  rt_double_parameter(ludwig->rt, "cylinder_force_d_ref",
+                      &ludwig->cylinder_force_d_ref);
+
+  rt_double_parameter(ludwig->rt, "cylinder_force_span_ref",
+                      &ludwig->cylinder_force_span_ref);
+
+  have_centre = rt_double_parameter_vector(
+      ludwig->rt, "porous_media_cylinder_center", centre);
+
+  if (have_centre == 0) {
+    pe_fatal(pe,
+             "Cylinder torque output requires "
+             "porous_media_cylinder_center\n");
+  }
+
+  /*
+   * By default, compute torque about the physical cylinder centre.
+   * An optional independent reference point is useful for verifying
+   * the moment arm and cross-product sign via the parallel-axis rule.
+   */
+  torque_centre[X] = centre[X];
+  torque_centre[Y] = centre[Y];
+  torque_centre[Z] = centre[Z];
+
+  have_torque_centre = rt_double_parameter_vector(
+      ludwig->rt, "cylinder_torque_center", torque_centre);
+
+  wall_torque_center_set(ludwig->wall, torque_centre);
+
+  ludwig->cylinder_force_freq = 1;
+  rt_int_parameter(ludwig->rt, "cylinder_force_freq",
+                   &ludwig->cylinder_force_freq);
+
+  /*
+   * Flush only every N output records. This avoids forcing a file-system
+   * synchronisation after every row while retaining a configurable
+   * crash-safety/performance trade-off. Set to 1 for the old behaviour.
+   */
+  ludwig->cylinder_force_flush_freq = 100;
+  rt_int_parameter(ludwig->rt, "cylinder_force_flush_freq",
+                   &ludwig->cylinder_force_flush_freq);
+
+  ludwig->cylinder_force_output_count = 0;
+
+  rt_string_parameter(ludwig->rt, "cylinder_force_filename",
+                      filename, FILENAME_MAX);
+
+  if (ludwig->cylinder_force_rho_ref <= 0.0 ||
+      ludwig->cylinder_force_u_ref <= 0.0 ||
+      ludwig->cylinder_force_d_ref <= 0.0 ||
+      ludwig->cylinder_force_span_ref <= 0.0) {
+    pe_fatal(pe, "Cylinder force reference values must be positive\n");
+  }
+
+  if (ludwig->cylinder_force_freq <= 0) {
+    pe_fatal(pe, "cylinder_force_freq must be positive\n");
+  }
+
+  if (ludwig->cylinder_force_flush_freq <= 0) {
+    pe_fatal(pe, "cylinder_force_flush_freq must be positive\n");
+  }
+
+  ntstep = physics_control_timestep(ludwig->phys);
+
+  ludwig->cylinder_force_previous_step = ntstep;
+  ludwig->cylinder_force_previous_gwall[X] = 0.0;
+  ludwig->cylinder_force_previous_gwall[Y] = 0.0;
+  ludwig->cylinder_force_previous_gwall[Z] = 0.0;
+
+  ludwig->cylinder_force_previous_twall[X] = 0.0;
+  ludwig->cylinder_force_previous_twall[Y] = 0.0;
+  ludwig->cylinder_force_previous_twall[Z] = 0.0;
+
+  ludwig->cylinder_force_have_previous = 1;
+
+  if (rank == 0) {
+
+    const char * mode = (ntstep == 0) ? "w" : "a+";
+
+    ludwig->cylinder_force_fp = fopen(filename, mode);
+
+    if (ludwig->cylinder_force_fp == NULL) {
+      pe_fatal(pe, "Could not open cylinder force output file\n");
+    }
+
+    if (ntstep == 0) {
+      fprintf(ludwig->cylinder_force_fp,
+              "step,dt,Fx,Fy,Fz,CD,CL,CZ,"
+              "Tx,Ty,Tz,CMx,CMy,CMz,"
+              "gwall_x,gwall_y,gwall_z,"
+              "twall_x,twall_y,twall_z\n");
+    }
+    else {
+      long nbyte = 0;
+
+      if (fseek(ludwig->cylinder_force_fp, 0L, SEEK_END) != 0) {
+        pe_fatal(pe, "Could not seek cylinder force output file\n");
+      }
+
+      nbyte = ftell(ludwig->cylinder_force_fp);
+
+      if (nbyte < 0) {
+        pe_fatal(pe, "Could not inspect cylinder force output file\n");
+      }
+
+      if (nbyte == 0) {
+        fprintf(ludwig->cylinder_force_fp,
+                "step,dt,Fx,Fy,Fz,CD,CL,CZ,"
+              "Tx,Ty,Tz,CMx,CMy,CMz,"
+              "gwall_x,gwall_y,gwall_z,"
+              "twall_x,twall_y,twall_z\n");
+      }
+    }
+
+    fflush(ludwig->cylinder_force_fp);
+  }
+
+  pe_info(pe, "\n");
+  pe_info(pe, "Cylinder force time series\n");
+  pe_info(pe, "--------------------------\n");
+  pe_info(pe, "Output file:              %s\n", filename);
+  pe_info(pe, "Output frequency:         %d\n",
+          ludwig->cylinder_force_freq);
+  pe_info(pe, "Flush frequency (rows):   %d\n",
+          ludwig->cylinder_force_flush_freq);
+  pe_info(pe, "Reference rho:          %14.7e\n",
+          ludwig->cylinder_force_rho_ref);
+  pe_info(pe, "Reference speed:        %14.7e\n",
+          ludwig->cylinder_force_u_ref);
+  pe_info(pe, "Reference diameter:     %14.7e\n",
+          ludwig->cylinder_force_d_ref);
+  pe_info(pe, "Reference span:         %14.7e\n",
+          ludwig->cylinder_force_span_ref);
+  pe_info(pe, "Cylinder centre:        %14.7e %14.7e %14.7e\n",
+          centre[X], centre[Y], centre[Z]);
+  pe_info(pe, "Torque centre:          %14.7e %14.7e %14.7e%s\n",
+          torque_centre[X], torque_centre[Y], torque_centre[Z],
+          have_torque_centre ? " (user supplied)" : " (cylinder centre)");
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  ludwig_cylinder_force_write
+ *
+ *  wall_momentum() is cumulative. The increment since the preceding output
+ *  divided by the elapsed number of time steps is the interval force. With
+ *  cylinder_force_freq 1 this is the force from the current LB time step.
+ *
+ *****************************************************************************/
+
+static int ludwig_cylinder_force_write(ludwig_t * ludwig, int itimestep) {
+
+  int rank = 0;
+  int dt = 0;
+
+  /*
+   * Pack force and torque into one six-component collective. This halves
+   * the collective latency relative to two separate MPI_Reduce calls.
+   */
+  double local[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  double global[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+  double * glocal = local;
+  double * tlocal = local + 3;
+  double * gglobal = global;
+  double * tglobal = global + 3;
+
+  double force[3] = {0.0, 0.0, 0.0};
+  double coeff[3] = {0.0, 0.0, 0.0};
+  double torque[3] = {0.0, 0.0, 0.0};
+  double moment_coeff[3] = {0.0, 0.0, 0.0};
+
+  double denominator = 0.0;
+  double moment_denominator = 0.0;
+
+  MPI_Comm comm = MPI_COMM_NULL;
+
+  assert(ludwig);
+
+  if (!ludwig->cylinder_force_output) return 0;
+
+  /*
+   * wall_momentum() and wall_torque() are cumulative. Therefore they only
+   * need to be sampled on requested output steps; the difference from the
+   * preceding sample remains the exact interval-integrated exchange.
+   *
+   * This early return is deliberately before MPI_Reduce, eliminating the
+   * global synchronisation on non-output steps.
+   */
+  if (itimestep % ludwig->cylinder_force_freq != 0) return 0;
+
+  pe_mpi_comm(ludwig->pe, &comm);
+  MPI_Comm_rank(comm, &rank);
+
+  wall_momentum(ludwig->wall, glocal);
+  wall_torque(ludwig->wall, tlocal);
+
+  MPI_Reduce(local, global, 6, MPI_DOUBLE, MPI_SUM, 0, comm);
+
+  if (rank != 0) return 0;
+
+  if (!ludwig->cylinder_force_have_previous) {
+
+    ludwig->cylinder_force_previous_step = itimestep;
+
+    ludwig->cylinder_force_previous_gwall[X] = gglobal[X];
+    ludwig->cylinder_force_previous_gwall[Y] = gglobal[Y];
+    ludwig->cylinder_force_previous_gwall[Z] = gglobal[Z];
+
+    ludwig->cylinder_force_previous_twall[X] = tglobal[X];
+    ludwig->cylinder_force_previous_twall[Y] = tglobal[Y];
+    ludwig->cylinder_force_previous_twall[Z] = tglobal[Z];
+
+    ludwig->cylinder_force_have_previous = 1;
+
+    return 0;
+  }
+
+  dt = itimestep - ludwig->cylinder_force_previous_step;
+
+  if (dt <= 0) {
+    pe_fatal(ludwig->pe,
+             "Cylinder force output requires increasing time steps\n");
+  }
+
+  force[X] =
+    (gglobal[X] - ludwig->cylinder_force_previous_gwall[X])/(double) dt;
+
+  force[Y] =
+    (gglobal[Y] - ludwig->cylinder_force_previous_gwall[Y])/(double) dt;
+
+  force[Z] =
+    (gglobal[Z] - ludwig->cylinder_force_previous_gwall[Z])/(double) dt;
+
+  torque[X] =
+    (tglobal[X] - ludwig->cylinder_force_previous_twall[X])/(double) dt;
+
+  torque[Y] =
+    (tglobal[Y] - ludwig->cylinder_force_previous_twall[Y])/(double) dt;
+
+  torque[Z] =
+    (tglobal[Z] - ludwig->cylinder_force_previous_twall[Z])/(double) dt;
+
+  denominator =
+    0.5*ludwig->cylinder_force_rho_ref*
+    ludwig->cylinder_force_u_ref*ludwig->cylinder_force_u_ref*
+    ludwig->cylinder_force_d_ref*
+    ludwig->cylinder_force_span_ref;
+
+  coeff[X] = force[X]/denominator;
+  coeff[Y] = force[Y]/denominator;
+  coeff[Z] = force[Z]/denominator;
+
+  moment_denominator =
+    denominator*ludwig->cylinder_force_d_ref;
+
+  moment_coeff[X] = torque[X]/moment_denominator;
+  moment_coeff[Y] = torque[Y]/moment_denominator;
+  moment_coeff[Z] = torque[Z]/moment_denominator;
+
+  assert(ludwig->cylinder_force_fp);
+
+  fprintf(ludwig->cylinder_force_fp,
+          "%d,%d,%.17e,%.17e,%.17e,"
+          "%.17e,%.17e,%.17e,"
+          "%.17e,%.17e,%.17e,"
+          "%.17e,%.17e,%.17e,"
+          "%.17e,%.17e,%.17e,"
+          "%.17e,%.17e,%.17e\n",
+          itimestep, dt,
+          force[X], force[Y], force[Z],
+          coeff[X], coeff[Y], coeff[Z],
+          torque[X], torque[Y], torque[Z],
+          moment_coeff[X], moment_coeff[Y], moment_coeff[Z],
+          gglobal[X], gglobal[Y], gglobal[Z],
+          tglobal[X], tglobal[Y], tglobal[Z]);
+
+  ludwig->cylinder_force_output_count += 1;
+
+  if (ludwig->cylinder_force_output_count %
+      ludwig->cylinder_force_flush_freq == 0) {
+    fflush(ludwig->cylinder_force_fp);
+  }
+
+  ludwig->cylinder_force_previous_step = itimestep;
+
+  ludwig->cylinder_force_previous_gwall[X] = gglobal[X];
+  ludwig->cylinder_force_previous_gwall[Y] = gglobal[Y];
+  ludwig->cylinder_force_previous_gwall[Z] = gglobal[Z];
+
+  ludwig->cylinder_force_previous_twall[X] = tglobal[X];
+  ludwig->cylinder_force_previous_twall[Y] = tglobal[Y];
+  ludwig->cylinder_force_previous_twall[Z] = tglobal[Z];
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
+ *  ludwig_cylinder_force_finish
+ *
+ *****************************************************************************/
+
+static int ludwig_cylinder_force_finish(ludwig_t * ludwig) {
+
+  assert(ludwig);
+
+  if (ludwig->cylinder_force_fp) {
+    fflush(ludwig->cylinder_force_fp);
+    fclose(ludwig->cylinder_force_fp);
+    ludwig->cylinder_force_fp = NULL;
+  }
+
+  return 0;
+}
+
+/*****************************************************************************
+ *
  *  ludwig_report_momentum
  *
  *  Tidy report of the current momentum of the system.
  *
  *****************************************************************************/
 
-static int ludwig_report_momentum(ludwig_t * ludwig) {
+static int ludwig_report_momentum(ludwig_t * ludwig, int itimestep) {
 
   int n;
   int ncolloid;
   int is_pm;
+  int have_walls;
+  int rank = 0;
+  int force_output = 0;
 
   double g[3];         /* Fluid momentum (total) */
   double gc[3];        /* Colloid momentum (total) */
-  double gwall[3];     /* Wall momentum (for accounting purposes only) */
+  double gwall[3];     /* Wall/porous-media cumulative momentum */
   double gtotal[3];
+
+  double rho_ref = 1.0;
+  double u_ref = 0.0;
+  double d_ref = 0.0;
+  double span_ref = 0.0;
+
+  static int have_previous = 0;
+  static int previous_step = 0;
+  static double previous_gwall[3] = {0.0, 0.0, 0.0};
 
   MPI_Comm comm;
   pe_t * pe = NULL;
 
+  assert(ludwig);
+
   pe = ludwig->pe;
   pe_mpi_comm(pe, &comm);
+  MPI_Comm_rank(comm, &rank);
+
   wall_is_pm(ludwig->wall, &is_pm);
+  have_walls = wall_present(ludwig->wall);
+
+  /*
+   * Optional cylinder-force diagnostic.
+   *
+   * This diagnostic is currently valid only when porous media are
+   * present and no external boundary walls are present. Under that
+   * condition, wall momentum is cylinder momentum alone.
+   */
+  force_output = rt_switch(ludwig->rt, "cylinder_force_output");
+
+  if (force_output) {
+
+    physics_rho0(ludwig->phys, &rho_ref);
+
+    rt_double_parameter(ludwig->rt,
+                        "cylinder_force_u_ref", &u_ref);
+
+    rt_double_parameter(ludwig->rt,
+                        "cylinder_force_d_ref", &d_ref);
+
+    rt_double_parameter(ludwig->rt,
+                        "cylinder_force_span_ref", &span_ref);
+
+    if (!is_pm) {
+      pe_fatal(pe,
+               "cylinder_force_output requires porous media\n");
+    }
+
+    if (have_walls) {
+      pe_fatal(pe,
+               "cylinder_force_output currently requires "
+               "boundary_walls 0_0_0\n");
+    }
+
+    if (u_ref <= 0.0 || d_ref <= 0.0 || span_ref <= 0.0) {
+      pe_fatal(pe,
+               "Cylinder force reference values must be positive\n");
+    }
+  }
 
   for (n = 0; n < 3; n++) {
     gtotal[n] = 0.0;
@@ -1113,10 +1805,13 @@ static int ludwig_report_momentum(ludwig_t * ludwig) {
   stats_colloid_momentum(ludwig->collinfo, gc);
   colloids_info_ntotal(ludwig->collinfo, &ncolloid);
 
-  if (wall_present(ludwig->wall) || is_pm) {
-    double gtmp[3];
+  if (have_walls || is_pm) {
+    double gtmp[3] = {0.0, 0.0, 0.0};
+
     wall_momentum(ludwig->wall, gtmp);
-    MPI_Reduce(gtmp, gwall, 3, MPI_DOUBLE, MPI_SUM, 0, comm);
+
+    MPI_Reduce(gtmp, gwall, 3, MPI_DOUBLE,
+               MPI_SUM, 0, comm);
   }
 
   for (n = 0; n < 3; n++) {
@@ -1125,13 +1820,86 @@ static int ludwig_report_momentum(ludwig_t * ludwig) {
 
   pe_info(pe, "\n");
   pe_info(pe, "Momentum - x y z\n");
-  pe_info(pe, "[total   ] %14.7e %14.7e %14.7e\n", gtotal[X], gtotal[Y], gtotal[Z]);
-  pe_info(pe, "[fluid   ] %14.7e %14.7e %14.7e\n", g[X], g[Y], g[Z]);
+
+  pe_info(pe,
+          "[total   ] %14.7e %14.7e %14.7e\n",
+          gtotal[X], gtotal[Y], gtotal[Z]);
+
+  pe_info(pe,
+          "[fluid   ] %14.7e %14.7e %14.7e\n",
+          g[X], g[Y], g[Z]);
+
   if (ncolloid > 0) {
-    pe_info(pe, "[colloids] %14.7e %14.7e %14.7e\n", gc[X], gc[Y], gc[Z]);
+    pe_info(pe,
+            "[colloids] %14.7e %14.7e %14.7e\n",
+            gc[X], gc[Y], gc[Z]);
   }
-  if (wall_present(ludwig->wall) || is_pm) {
-    pe_info(pe, "[walls   ] %14.7e %14.7e %14.7e\n", gwall[X], gwall[Y], gwall[Z]);
+
+  if (have_walls || is_pm) {
+    pe_info(pe,
+            "[walls   ] %14.7e %14.7e %14.7e\n",
+            gwall[X], gwall[Y], gwall[Z]);
+  }
+
+  /*
+   * wall->fnet is a cumulative momentum exchange.
+   * The increment between two statistics samples divided by the
+   * elapsed number of lattice time steps is the interval-averaged
+   * force exerted by the fluid on the fixed cylinder.
+   */
+  if (force_output && rank == 0) {
+
+    if (!have_previous) {
+
+      previous_step = itimestep;
+
+      previous_gwall[X] = gwall[X];
+      previous_gwall[Y] = gwall[Y];
+      previous_gwall[Z] = gwall[Z];
+
+      have_previous = 1;
+    }
+    else if (itimestep > previous_step) {
+
+      int dt = itimestep - previous_step;
+
+      double force_avg[3] = {0.0, 0.0, 0.0};
+      double coeff_avg[3] = {0.0, 0.0, 0.0};
+
+      double denominator =
+        0.5*rho_ref*u_ref*u_ref*d_ref*span_ref;
+
+      force_avg[X] =
+        (gwall[X] - previous_gwall[X])/(double) dt;
+
+      force_avg[Y] =
+        (gwall[Y] - previous_gwall[Y])/(double) dt;
+
+      force_avg[Z] =
+        (gwall[Z] - previous_gwall[Z])/(double) dt;
+
+      coeff_avg[X] = force_avg[X]/denominator;
+      coeff_avg[Y] = force_avg[Y]/denominator;
+      coeff_avg[Z] = force_avg[Z]/denominator;
+
+      pe_info(pe,
+              "[cylinder interval] %d %d %d\n",
+              previous_step, itimestep, dt);
+
+      pe_info(pe,
+              "[cylinder force avg] %14.7e %14.7e %14.7e\n",
+              force_avg[X], force_avg[Y], force_avg[Z]);
+
+      pe_info(pe,
+              "[cylinder coeff avg] %14.7e %14.7e %14.7e\n",
+              coeff_avg[X], coeff_avg[Y], coeff_avg[Z]);
+
+      previous_step = itimestep;
+
+      previous_gwall[X] = gwall[X];
+      previous_gwall[Y] = gwall[Y];
+      previous_gwall[Z] = gwall[Z];
+    }
   }
 
   return 0;
