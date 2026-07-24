@@ -109,6 +109,7 @@
 /* Statistics */
 #include "stats_colloid.h"
 #include "stats_colloid_force_split.h"
+#include "stats_colloid_force_io.h"
 #include "stats_turbulent.h"
 #include "stats_surfactant.h"
 #include "stats_rheology.h"
@@ -175,6 +176,8 @@ struct ludwig_s {
   stats_ahydro_t * stat_ah;    /* Hydrodynamic radius calibration */
   stats_rheo_t * stat_rheo;    /* Rheology diagnostics */
   stats_turb_t * stat_turb;    /* Turbulent diagnostics */
+  stats_colloid_force_io_t * stat_colloid_force_io;
+                                  /* Per-colloid BBL force output */
   timekeeper_t tk;             /* Time keeper */
 
   /* Optional +X outlet momentum sponge */
@@ -308,6 +311,11 @@ static int ludwig_rt(ludwig_t * ludwig) {
 
   bbl_create(pe, ludwig->cs, ludwig->lb, &ludwig->bbl);
   bbl_active_set(ludwig->bbl, ludwig->collinfo);
+
+  stats_colloid_force_io_create(pe, rt, ludwig->collinfo,
+                                physics_control_timestep(ludwig->phys),
+                                (ludwig->hydro != NULL),
+                                &ludwig->stat_colloid_force_io);
   {
     /* Kludge: this switch is unlikely to be required as the default
      * method of quaternions (ellipsoid_didt = 0) is exact */
@@ -913,6 +921,10 @@ void ludwig_run(const char * inputfile) {
     }
 
     TIMER_start(TIMER_DIAGNOSTIC_OUTPUT); /* Time diagnostics and i/o */
+
+    /* The diagnostic was assembled during the current BBL step. Write it
+     * after propagation so the BBL-to-propagation sequence remains untouched. */
+    stats_colloid_force_io_write(ludwig->stat_colloid_force_io, step);
     
     /* Configuration dump */
 
@@ -1069,6 +1081,8 @@ void ludwig_run(const char * inputfile) {
   if (ludwig->phi)      field_free(ludwig->phi);
   if (ludwig->p)        field_free(ludwig->p);
   if (ludwig->q)        field_free(ludwig->q);
+
+  stats_colloid_force_io_free(&ludwig->stat_colloid_force_io);
 
   bbl_free(ludwig->bbl);
   colloids_info_free(ludwig->collinfo);
