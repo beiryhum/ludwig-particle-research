@@ -33,6 +33,10 @@
 #include "bbl.h"
 #include "colloid.h"
 #include "colloids.h"
+#include "bbl_link_diag.h"
+#include "bbl_surface_stress_diag.h"
+/* CASE08_SURFACE_STRESS_DIAG_V1 */
+/* CASE08_BBL_DIAG_V2 */
 
 
 /* Ellipsoid update mechanism flag */
@@ -53,6 +57,7 @@ struct bbl_s {
   double eta;           /* Dynamic viscosity for lubrication correction */
   double deltag;        /* Excess or deficit of phi between steps */
   double stress[3][3];  /* Surface stress diagnostic */
+  bbl_link_diag_t * link_diag; /* Optional exact link diagnostic */
 };
 
 static int bbl_pass1(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo);
@@ -134,6 +139,7 @@ int bbl_free(bbl_t * bbl) {
 
   assert(bbl);
 
+  bbl_link_diag_free(&bbl->link_diag);
   free(bbl);
 
   return 0;
@@ -197,6 +203,38 @@ int bbl_active_set(bbl_t * bbl, colloids_info_t * cinfo) {
 
 /*****************************************************************************
  *
+ *  bbl_link_diagnostic_init
+ *
+ *  Configure the optional read-only exact moving-BBL link diagnostic.
+ *
+ *****************************************************************************/
+
+int bbl_link_diagnostic_init(bbl_t * bbl, rt_t * rt,
+                             colloids_info_t * cinfo, int nstart) {
+
+  assert(bbl);
+  assert(rt);
+  assert(cinfo);
+
+  return bbl_link_diag_create(bbl->pe, bbl->cs, rt, cinfo, nstart,
+                              &bbl->link_diag);
+}
+
+/*****************************************************************************
+ *
+ *  bbl_link_diagnostic_step_set
+ *
+ *****************************************************************************/
+
+int bbl_link_diagnostic_step_set(bbl_t * bbl, int step) {
+
+  assert(bbl);
+
+  return bbl_link_diag_step_set(bbl->link_diag, step);
+}
+
+/*****************************************************************************
+ *
  *  bounce_back_on_links
  *
  *  Driver routine for colloid bounce back on links.
@@ -243,6 +281,9 @@ int bounce_back_on_links(bbl_t * bbl, lb_t * lb, wall_t * wall,
   bbl_pass1(bbl, lb, cinfo);
 
   colloid_sums_halo(cinfo, COLLOID_SUM_DYNAMICS);
+
+  /* CASE08_BBL_DIAG_V2: capture the actual post-halo pass1 f0/t0. */
+  bbl_link_diag_pass1_total_capture(bbl->link_diag, cinfo);
 
   if (bbl->active) {
     bbl_active_conservation(bbl, lb, cinfo);
@@ -522,6 +563,8 @@ static int bbl_pass1(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
 
       assert(ij > 0 && ij < lb->model.nvel);
 
+      double dm_active = 0.0; /* CASE08_BBL_DIAG_V2 */
+
       /* For stationary link, the momentum transfer from the
        * fluid to the colloid is "dm" */
 
@@ -672,6 +715,7 @@ static int bbl_pass1(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
 	lb_f_set(lb, i, ij, 0, fdist);
 
 	dm += dm_a;
+	dm_active = dm_a; /* CASE08_BBL_DIAG_V2 */
 
 	/* needed for mass conservation   */
 	pc->sump += dm_a;
@@ -692,6 +736,60 @@ static int bbl_pass1(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
       }
 
       cross_product(p_link->rb, c, rbxc);
+
+      /* CASE08_BBL_DIAG_V2: Pass-1 exact source decomposition.
+       * The lattice site i is the owner key for all link classes. */
+      if (bbl_link_diag_active_for(bbl->link_diag, pc->s.index)) {
+        int ilocal_diag[3] = {0};
+        int nlocal_diag[3] = {0};
+
+        cs_index_to_ijk(bbl->cs, i, ilocal_diag);
+        cs_nlocal(bbl->cs, nlocal_diag);
+
+        if (ilocal_diag[X] >= 1 && ilocal_diag[X] <= nlocal_diag[X] &&
+            ilocal_diag[Y] >= 1 && ilocal_diag[Y] <= nlocal_diag[Y] &&
+            ilocal_diag[Z] >= 1 && ilocal_diag[Z] <= nlocal_diag[Z]) {
+
+          double fdiag[3] = {0};
+          double tdiag[3] = {0};
+
+          if (p_link->status == LINK_FLUID) {
+            for (ia = 0; ia < 3; ia++) {
+              fdiag[ia] = (dm - dm_active)*c[ia];
+              tdiag[ia] = (dm - dm_active)*rbxc[ia];
+            }
+            bbl_link_diag_pass1_component_add(
+                bbl->link_diag, pc->s.index, BBL_LINK_DIAG_PASS1_FLUID,
+                fdiag, tdiag);
+
+            for (ia = 0; ia < 3; ia++) {
+              fdiag[ia] = dm_active*c[ia];
+              tdiag[ia] = dm_active*rbxc[ia];
+            }
+            bbl_link_diag_pass1_component_add(
+                bbl->link_diag, pc->s.index, BBL_LINK_DIAG_PASS1_ACTIVE,
+                fdiag, tdiag);
+          }
+          else if (p_link->status == LINK_COLLOID) {
+            for (ia = 0; ia < 3; ia++) {
+              fdiag[ia] = dm*c[ia];
+              tdiag[ia] = dm*rbxc[ia];
+            }
+            bbl_link_diag_pass1_component_add(
+                bbl->link_diag, pc->s.index, BBL_LINK_DIAG_PASS1_COLLOID,
+                fdiag, tdiag);
+          }
+          else if (p_link->status == LINK_BOUNDARY) {
+            for (ia = 0; ia < 3; ia++) {
+              fdiag[ia] = dm*c[ia];
+              tdiag[ia] = dm*rbxc[ia];
+            }
+            bbl_link_diag_pass1_component_add(
+                bbl->link_diag, pc->s.index, BBL_LINK_DIAG_PASS1_BOUNDARY,
+                fdiag, tdiag);
+          }
+        }
+      }
 
       /* Now add contribution to the sums required for
        * self-consistent evaluation of new velocities. */
@@ -802,6 +900,18 @@ static int bbl_pass2(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
 
     if (pc->s.bc != COLLOID_BC_BBL) continue;
 
+    int particle_copy_is_local = 0;
+    {
+      colloid_t * p_local = NULL;
+      colloids_info_local_head(cinfo, &p_local);
+      for (; p_local; p_local = p_local->nextlocal) {
+        if (p_local == pc) {
+          particle_copy_is_local = 1;
+          break;
+        }
+      }
+    }
+
     /* Set correction for phi arising from previous step */
 
     dgtm1 = pc->s.deltaphi;
@@ -833,6 +943,7 @@ static int bbl_pass2(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
       if (p_link->status == LINK_FLUID) {
 
 	lb_f(lb, i, ij, 0, &fdist);
+	double fdist_in = fdist;
 	dm =  2.0*fdist - lb->model.wv[ij]*pc->deltam;
 
 	/* Compute the self-consistent boundary velocity,
@@ -854,6 +965,94 @@ static int bbl_pass2(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
 	/* Correction owing to missing links "squeeze term" */
 
 	df -= lb->model.wv[ij]*dms;
+
+
+
+	/* CASE08_BBL_DIAG_V2: two independent pass-2 diagnostic paths.
+	 * Both are restricted to the rank owning the outside lattice site i. */
+	if (bbl_link_diag_active_for(bbl->link_diag, pc->s.index)) {
+	  int ilocal[3] = {0};
+	  int jlocal[3] = {0};
+	  int nlocal[3] = {0};
+	  int noffset[3] = {0};
+	  int ntotal[3] = {0};
+	  int periodic[3] = {0};
+
+	  cs_index_to_ijk(bbl->cs, i, ilocal);
+	  cs_index_to_ijk(bbl->cs, j, jlocal);
+	  cs_nlocal(bbl->cs, nlocal);
+
+	  if (ilocal[X] >= 1 && ilocal[X] <= nlocal[X] &&
+	      ilocal[Y] >= 1 && ilocal[Y] <= nlocal[Y] &&
+	      ilocal[Z] >= 1 && ilocal[Z] <= nlocal[Z]) {
+
+	    double reference_force[3] = {0};
+	    double reference_torque[3] = {0};
+	    bbl_link_record_t record = {0};
+
+	    /* Reference accumulator: no dependency on the CSV record array. */
+	    for (ia = 0; ia < 3; ia++) {
+	      reference_force[ia] =
+	          (dm - df)*lb->model.cv[ij][ia];
+	    }
+	    cross_product(p_link->rb, reference_force, reference_torque);
+	    bbl_link_diag_pass2_reference_add(
+	        bbl->link_diag, pc->s.index, reference_force, reference_torque);
+
+	    /* CSV path: recompute dF and dT independently into the record. */
+	    cs_nlocal_offset(bbl->cs, noffset);
+	    cs_ntotal(bbl->cs, ntotal);
+	    cs_periodic(bbl->cs, periodic);
+
+	    record.step = 0;
+	    record.particle_index = pc->s.index;
+	    record.owner_rank = cs_cart_rank(bbl->cs);
+	    record.particle_copy_is_local = particle_copy_is_local;
+	    record.p = ij;
+
+	    for (ia = 0; ia < 3; ia++) {
+	      record.fluid_site[ia] = noffset[ia] + ilocal[ia];
+	      record.solid_site[ia] = noffset[ia] + jlocal[ia];
+
+	      if (periodic[ia]) {
+	        while (record.fluid_site[ia] < 1) {
+	          record.fluid_site[ia] += ntotal[ia];
+	        }
+	        while (record.fluid_site[ia] > ntotal[ia]) {
+	          record.fluid_site[ia] -= ntotal[ia];
+	        }
+	        while (record.solid_site[ia] < 1) {
+	          record.solid_site[ia] += ntotal[ia];
+	        }
+	        while (record.solid_site[ia] > ntotal[ia]) {
+	          record.solid_site[ia] -= ntotal[ia];
+	        }
+	      }
+
+	      record.c[ia] = lb->model.cv[ij][ia];
+	      record.rb[ia] = p_link->rb[ia];
+	      record.v[ia] = pc->s.v[ia];
+	      record.w[ia] = pc->s.w[ia];
+	      record.ub[ia] = pc->s.v[ia] + wxrb[ia];
+	      record.dF[ia] = (dm - df)*lb->model.cv[ij][ia];
+	    }
+
+	    cross_product(p_link->rb, record.dF, record.dT);
+
+	    record.fdist_in = fdist_in;
+	    record.dm = dm;
+	    record.df = df;
+	    record.deltam = pc->deltam;
+	    record.dms = dms;
+	    record.sump = pc->sump;
+
+	    bbl_link_diag_record(bbl->link_diag, &record);
+	  }
+	}
+
+	/* CASE08_SURFACE_STRESS_DIAG_V1: read-only post-collision / pre-particle-BBL snapshot.
+	 * This call is before the outside-site BBL distribution write. */
+	bbl_surface_stress_diag_pass2_link(lb, pc, p_link, i, j);
 
 	/* The outside site actually undergoes BBL. */
 
@@ -915,6 +1114,8 @@ static int bbl_pass2(bbl_t * bbl, lb_t * lb, colloids_info_t * cinfo) {
     bbl->deltag += pc->s.deltaphi;
   }
 
+  bbl_surface_stress_diag_end_step();
+  bbl_link_diag_end(bbl->link_diag, cinfo);
 
   return 0;
 }

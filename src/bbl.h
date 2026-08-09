@@ -17,6 +17,7 @@
 #include "coords.h"
 #include "colloids.h"
 #include "lb_data.h"
+#include "runtime.h"
 #include "wall.h"
 
 typedef struct bbl_s bbl_t;
@@ -35,5 +36,10 @@ int bbl_6x6_gaussian_elimination(double a[6][6], double xb[6]);
 
 int bbl_surface_stress(bbl_t * bbl, double slocal[3][3]);
 int bbl_order_parameter_deficit(bbl_t * bbl, double * delta);
+
+/* Optional exact moving-BBL per-link force/torque diagnostic. */
+int bbl_link_diagnostic_init(bbl_t * bbl, rt_t * rt,
+                             colloids_info_t * cinfo, int nstart);
+int bbl_link_diagnostic_step_set(bbl_t * bbl, int step);
 
 #endif

@@ -31,6 +31,8 @@
 #include "util_vector.h"
 #include "wall.h"
 #include "build.h"
+#include "bbl_link_diag.h"
+/* CASE08_BBL_DIAG_V2 */
 #include "blue_phase.h"
 
 
@@ -779,6 +781,9 @@ static int build_remove_fluid(lb_t * lb, int index, colloid_t * p_colloid) {
     p_colloid->t0[ia] += rtmp[ia];
   }
 
+  bbl_link_diag_build_source_add(lb->cs, p_colloid->s.index, index,
+                                 g, rtmp);
+
   return 0;
 }
 
@@ -940,6 +945,9 @@ static int build_replace_fluid(lb_t * lb, colloids_info_t * cinfo, int index,
     for (ia = 0; ia < 3; ia++) {
       p_colloid->t0[ia] += rtmp[ia];
     }
+
+    bbl_link_diag_build_source_add(lb->cs, p_colloid->s.index, index,
+                                   g, rtmp);
   }
 
   return 0;
@@ -1007,6 +1015,9 @@ int build_replace_fluid_local(colloids_info_t * cinfo, colloid_t * pc,
     pc->f0[ia] += gnew[ia];
     pc->t0[ia] += tnew[ia];
   }
+
+  bbl_link_diag_build_source_add(lb->cs, pc->s.index, index,
+                                 gnew, tnew);
 
   return 0;
 }

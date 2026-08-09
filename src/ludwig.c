@@ -35,6 +35,8 @@
 
 #include "model_le.h"
 #include "bbl.h"
+#include "bbl_surface_stress_diag.h"
+/* CASE08_SURFACE_STRESS_DIAG_V1 */
 
 #include "collision.h"
 #include "propagation.h"
@@ -166,6 +168,8 @@ struct ludwig_s {
   ewald_t * ewald;             /* Ewald sum for dipoles */
   interact_t * interact;       /* Colloid-colloid interaction handler */
   bbl_t * bbl;                 /* Bounce-back on links boundary condition */
+  bbl_surface_stress_diag_t * bbl_surface_stress_diag;
+                                  /* Optional read-only local LB stress diagnostic */
 
   lb_bc_open_t * inflow;       /* Inflow open boundary conidition (fluid) */
   lb_bc_open_t * outflow;      /* Outflow boundary condition (fluid) */
@@ -311,6 +315,13 @@ static int ludwig_rt(ludwig_t * ludwig) {
 
   bbl_create(pe, ludwig->cs, ludwig->lb, &ludwig->bbl);
   bbl_active_set(ludwig->bbl, ludwig->collinfo);
+  bbl_link_diagnostic_init(ludwig->bbl, rt, ludwig->collinfo,
+                           physics_control_timestep(ludwig->phys));
+  bbl_surface_stress_diag_create(pe, ludwig->cs, rt, ludwig->collinfo,
+                                 ludwig->lb, ludwig->hydro,
+                                 physics_control_timestep(ludwig->phys),
+                                 (ludwig->visc != NULL),
+                                 &ludwig->bbl_surface_stress_diag);
 
   stats_colloid_force_io_create(pe, rt, ludwig->collinfo,
                                 physics_control_timestep(ludwig->phys),
@@ -567,6 +578,10 @@ void ludwig_run(const char * inputfile) {
     TIMER_start(TIMER_STEPS);
 
     step = physics_control_timestep(ludwig->phys);
+
+    /* CASE08_BBL_DIAG_V2: begin diagnostics before colloid rebuild. */
+    bbl_link_diagnostic_step_set(ludwig->bbl, step);
+    bbl_surface_stress_diag_step_set(ludwig->bbl_surface_stress_diag, step);
 
     if (ludwig->hydro) {
       hydro_f_zero(ludwig->hydro, fzero);
@@ -838,6 +853,10 @@ void ludwig_run(const char * inputfile) {
 	ludwig->visc->func->update(ludwig->visc, ludwig->hydro);
       }
 
+      /* CASE08 surface diagnostic: read-only pre-collision snapshot.
+       * Force and viscosity have already been assembled/updated. */
+      bbl_surface_stress_diag_pre_collision(ludwig->bbl_surface_stress_diag);
+
       /* Collision stage */
 
       TIMER_start(TIMER_COLLIDE);
@@ -894,6 +913,7 @@ void ludwig_run(const char * inputfile) {
       wall_set_wall_distributions(ludwig->wall);
 
       subgrid_update(ludwig->collinfo, ludwig->hydro, ludwig->lb->param->noise);
+      bbl_surface_stress_diag_prepare_pass2(ludwig->bbl_surface_stress_diag);
       bounce_back_on_links(ludwig->bbl, ludwig->lb, ludwig->wall,
 			   ludwig->collinfo);
       wall_bbl(ludwig->wall);
@@ -1083,6 +1103,8 @@ void ludwig_run(const char * inputfile) {
   if (ludwig->q)        field_free(ludwig->q);
 
   stats_colloid_force_io_free(&ludwig->stat_colloid_force_io);
+
+  bbl_surface_stress_diag_free(&ludwig->bbl_surface_stress_diag);
 
   bbl_free(ludwig->bbl);
   colloids_info_free(ludwig->collinfo);
